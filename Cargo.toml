@@ -1,0 +1,13 @@
+[package]
+name = "trusttunnel-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui = { path = "../zed/crates/gpui", default-features = false, features = ["wayland"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+unicode-segmentation = "1.11"
+log = "0.4"
+env_logger = "0.11"
+dirs = "6"
