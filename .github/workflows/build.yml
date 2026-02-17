@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  RUST_BACKTRACE: short
+  LINUX_DEPS: >-
+    pkg-config
+    libfontconfig-dev
+    libwayland-dev
+    libxkbcommon-x11-dev
+    libvulkan-dev
+    libxcb-composite0-dev
+    libxcb-present-dev
+    libxcb-shape0-dev
+    libxcb-xfixes0-dev
+    libxcb-render0-dev
+    libxcb-randr0-dev
+    libxcb-xinput-dev
+    libxcb-xkb-dev
+    libxcb-cursor-dev
+    libxcb-sync-dev
+    libxcb-dpms0-dev
+    libxcb-res0-dev
+
+jobs:
+  build-linux:
+    name: Build · Linux x86_64 (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [wayland, x11]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.backend }}
+
+      - name: Build
+        run: cargo build --release --no-default-features --features ${{ matrix.backend }}
+
+      - name: Strip
+        run: strip target/release/trusttunnel-ui
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trusttunnel-ui-linux-x86_64-${{ matrix.backend }}
+          path: target/release/trusttunnel-ui
+          if-no-files-found: error
+          compression-level: 9
+
+  build-windows:
+    name: Build · Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --no-default-features
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trusttunnel-ui-windows-x86_64
+          path: target/release/trusttunnel-ui.exe
+          if-no-files-found: error
+          compression-level: 9
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare assets
+        run: |
+          mkdir -p release
+          cp artifacts/trusttunnel-ui-linux-x86_64-wayland/trusttunnel-ui release/trusttunnel-ui-linux-x86_64-wayland
+          cp artifacts/trusttunnel-ui-linux-x86_64-x11/trusttunnel-ui     release/trusttunnel-ui-linux-x86_64-x11
+          cp artifacts/trusttunnel-ui-windows-x86_64/trusttunnel-ui.exe   release/trusttunnel-ui-windows-x86_64.exe
+          chmod +x release/trusttunnel-ui-linux-*
+          cd release && sha256sum * > SHA256SUMS
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          draft: true
+          generate_release_notes: true

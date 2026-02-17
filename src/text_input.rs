@@ -621,25 +621,27 @@ impl Element for TextElement {
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
         }
-        let line = prepaint.line.take().unwrap();
-        line.paint(
-            bounds.origin,
-            window.line_height(),
-            TextAlign::Left,
-            None,
-            window,
-            context,
-        )
-        .unwrap();
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
+        if let Some(line) = prepaint.line.take() {
+            if let Err(error) = line.paint(
+                bounds.origin,
+                window.line_height(),
+                TextAlign::Left,
+                None,
+                window,
+                context,
+            ) {
+                log::warn!("[text_input] failed to paint line: {error}");
+            }
+            if focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+            self.input.update(context, |input, _| {
+                input.last_layout = Some(line);
+                input.last_bounds = Some(bounds);
+            });
         }
-        self.input.update(context, |input, _| {
-            input.last_layout = Some(line);
-            input.last_bounds = Some(bounds);
-        });
     }
 }
 

@@ -45,28 +45,3 @@ impl ConnectionState {
         )
     }
 }
-
-pub struct ProcessLog {
-    pub lines: Vec<String>,
-    pub connected: bool,
-    pub error: Option<String>,
-    pub post_connect_error: Option<String>,
-}
-
-impl ProcessLog {
-    pub fn new() -> Self {
-        Self {
-            lines: Vec::new(),
-            connected: false,
-            error: None,
-            post_connect_error: None,
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.lines.clear();
-        self.connected = false;
-        self.error = None;
-        self.post_connect_error = None;
-    }
-}

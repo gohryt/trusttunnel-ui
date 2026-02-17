@@ -64,7 +64,7 @@ impl TextArea {
     }
 
     pub fn set_content(&mut self, text: &str) {
-        self.content = text.to_string();
+        self.content = text.replace("\r\n", "\n").replace('\r', "");
         self.recompute_line_offsets();
         let length = self.content.len();
         self.selected_range = length..length;
@@ -466,9 +466,9 @@ impl EntityInputHandler for TextArea {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.content =
-            self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        let clean = new_text.replace("\r\n", "\n").replace('\r', "");
+        self.content = self.content[..range.start].to_owned() + &clean + &self.content[range.end..];
+        self.selected_range = range.start + clean.len()..range.start + clean.len();
         self.marked_range.take();
         self.recompute_line_offsets();
         context.notify();
@@ -488,11 +488,11 @@ impl EntityInputHandler for TextArea {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.content =
-            self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
+        let clean = new_text.replace("\r\n", "\n").replace('\r', "");
+        self.content = self.content[..range.start].to_owned() + &clean + &self.content[range.end..];
 
-        if !new_text.is_empty() {
-            self.marked_range = Some(range.start..range.start + new_text.len());
+        if !clean.is_empty() {
+            self.marked_range = Some(range.start..range.start + clean.len());
         } else {
             self.marked_range = None;
         }
@@ -501,7 +501,7 @@ impl EntityInputHandler for TextArea {
             .as_ref()
             .map(|range| self.range_from_utf16(range))
             .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+            .unwrap_or_else(|| range.start + clean.len()..range.start + clean.len());
 
         self.recompute_line_offsets();
         context.notify();
@@ -746,8 +746,11 @@ impl Element for TextAreaElement {
                 bounds.left(),
                 bounds.top() + line_height * line_index as f32,
             );
-            line.paint(origin, line_height, TextAlign::Left, None, window, context)
-                .unwrap();
+            if let Err(error) =
+                line.paint(origin, line_height, TextAlign::Left, None, window, context)
+            {
+                log::warn!("[text_area] failed to paint line: {error}");
+            }
         }
         if focus_handle.is_focused(window)
             && let Some(cursor) = cursor

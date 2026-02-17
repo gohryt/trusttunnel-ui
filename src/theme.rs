@@ -14,6 +14,7 @@ pub const LOG_TEXT: u32 = 0x9a9a9a;
 pub const LOG_PLACEHOLDER: u32 = 0x555555;
 
 pub const BUTTON_PRIMARY: u32 = 0x7aa2f7;
+pub const BUTTON_PRIMARY_FOCUS: u32 = 0x4a6dab;
 pub const BUTTON_HOVER: u32 = 0x5d7ec9;
 pub const BUTTON_DANGER: u32 = 0xf7768e;
 pub const BUTTON_DANGER_HOVER: u32 = 0xd4566e;

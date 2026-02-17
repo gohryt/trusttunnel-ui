@@ -1,9 +1,9 @@
 use gpui::{
-    App, Div, Entity, FocusHandle, MouseButton, MouseUpEvent, Stateful, Window, div, prelude::*,
+    App, Div, ElementId, FocusHandle, MouseButton, MouseUpEvent, Stateful, Window, div, prelude::*,
     px, rgb,
 };
 
-use crate::{text_input::TextInput, theme::*};
+use crate::theme::*;
 
 pub fn label(text: &str) -> Div {
     div()
@@ -13,14 +13,14 @@ pub fn label(text: &str) -> Div {
         .child(text.to_string())
 }
 
-pub fn field(text: &str, input: &Entity<TextInput>) -> Div {
+pub fn field(text: &str, input: impl IntoElement) -> Div {
     div()
         .flex()
         .flex_col()
         .gap(px(GAP_EXTRA_SMALL))
         .w_full()
         .child(label(text))
-        .child(input.clone())
+        .child(input)
 }
 
 pub fn credential_item(
@@ -65,8 +65,8 @@ pub fn credential_item(
                 })
                 .when(active, |element| {
                     element
-                        .hover(|style| style.bg(rgb(BUTTON_DANGER_HOVER)))
-                        .focus(|style| style.bg(rgb(BUTTON_DANGER_HOVER)))
+                        .hover(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
+                        .focus(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
                 })
                 .when(!active, |element| {
                     element
@@ -115,8 +115,8 @@ pub fn toggle(
                         .cursor_pointer()
                         .when(value, |element| {
                             element
-                                .hover(|style| style.bg(rgb(BUTTON_DANGER_HOVER)))
-                                .focus(|style| style.bg(rgb(BUTTON_DANGER_HOVER)))
+                                .hover(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
+                                .focus(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
                         })
                         .when(!value, |element| {
                             element
@@ -164,8 +164,8 @@ pub fn selector_option(text: &str, active: bool, locked: bool, focus_handle: &Fo
                 .cursor_pointer()
                 .when(active, |element| {
                     element
-                        .hover(|style| style.bg(rgb(BUTTON_DANGER_HOVER)))
-                        .focus(|style| style.bg(rgb(BUTTON_DANGER_HOVER)))
+                        .hover(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
+                        .focus(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
                 })
                 .when(!active, |element| {
                     element
@@ -221,7 +221,7 @@ pub fn button_action(
                 .focus(|style| {
                     style
                         .border_color(rgb(BORDER_FOCUS))
-                        .bg(rgb(BUTTON_DANGER_HOVER))
+                        .bg(rgb(BUTTON_PRIMARY_FOCUS))
                 })
         })
         .text_color(rgb(text_color))
@@ -286,9 +286,9 @@ pub fn titlebar_title(text: &str) -> Div {
         .child(text.to_string())
 }
 
-pub fn titlebar_close() -> Stateful<Div> {
+pub fn titlebar_button(id: impl Into<ElementId>, text: &str, danger: bool) -> Stateful<Div> {
     div()
-        .id("titlebar-close")
+        .id(id)
         .flex()
         .items_center()
         .px(px(PADDING_COLUMN + PADDING_INPUT_HORIZONTAL))
@@ -296,12 +296,17 @@ pub fn titlebar_close() -> Stateful<Div> {
         .text_size(px(TEXT_SIZE_SMALL))
         .text_color(rgb(TEXT_DIM))
         .cursor_pointer()
-        .hover(|style| {
-            style
-                .bg(rgb(BUTTON_DANGER_HOVER))
-                .text_color(rgb(TEXT_WHITE))
+        .when(danger, |element| {
+            element.hover(|style| {
+                style
+                    .bg(rgb(BUTTON_DANGER_HOVER))
+                    .text_color(rgb(TEXT_WHITE))
+            })
         })
-        .child("Exit")
+        .when(!danger, |element| {
+            element.hover(|style| style.bg(rgb(BORDER)).text_color(rgb(TEXT_PRIMARY)))
+        })
+        .child(text.to_string())
 }
 
 pub fn log_container() -> Stateful<Div> {

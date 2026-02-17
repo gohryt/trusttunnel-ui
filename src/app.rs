@@ -2,21 +2,32 @@ use std::{
     fs,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use gpui::{
-    App, AsyncApp, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollAnchor, ScrollHandle, WeakEntity,
-    Window, actions, div, prelude::*, px, rgb,
+    App, AsyncApp, Bounds, Context, CursorStyle, Decorations, Entity, FocusHandle, Focusable,
+    HitboxBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, Point, ResizeEdge, ScrollAnchor, ScrollHandle, Size, WeakEntity, Window,
+    WindowControlArea, actions, canvas, div, point, prelude::*, px, rgb, transparent_black,
 };
 
 use crate::{
-    app_state::AppState, components::*, configuration::*, log_panel::LogPanel, state::*, system::*,
-    text_area::TextArea, text_input::TextInput, theme::*,
+    app_state::AppState,
+    components::*,
+    configuration::*,
+    connection_state::ConnectionState,
+    log_panel::LogPanel,
+    process_log::ProcessLog,
+    system::{self, *},
+    text_area::TextArea,
+    text_input::TextInput,
+    theme::*,
 };
+
+use system::dns::{self, DnsBackend};
+use system::proxy::{self as proxy, ProxyBackend};
 
 actions!(
     trusttunnel,
@@ -55,6 +66,7 @@ pub struct AppInitialization {
     pub post_quantum_group_enabled: bool,
     pub dns_enabled: bool,
     pub configuration_path: PathBuf,
+    pub system_services: Arc<dyn SystemServices>,
     pub log_panel: Entity<LogPanel>,
     pub binary_path: String,
     pub binary_found: bool,
@@ -66,37 +78,7 @@ pub struct AppInitialization {
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn session_timestamp() -> String {
-    let duration = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let total_seconds = duration.as_secs();
-    let time_of_day = total_seconds % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    let days = (total_seconds / 86400) as i64;
-    let adjusted_days = days + 719468;
-    let era = (if adjusted_days >= 0 {
-        adjusted_days
-    } else {
-        adjusted_days - 146096
-    }) / 146097;
-    let day_of_era = (adjusted_days - era * 146097) as u32;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_offset = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_offset + 2) / 5 + 1;
-    let month = if month_offset < 10 {
-        month_offset + 3
-    } else {
-        month_offset - 9
-    };
-    let year = if month <= 2 { year + 1 } else { year };
-
-    format!("{year:04}-{month:02}-{day:02}_{hours:02}-{minutes:02}-{seconds:02}")
+    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
 }
 
 pub struct TrustTunnelApp {
@@ -115,8 +97,9 @@ pub struct TrustTunnelApp {
     post_quantum_group_enabled: bool,
     dns_enabled: bool,
     tunnel_mode: TunnelMode,
+    system_services: Arc<dyn SystemServices>,
     connection_state: ConnectionState,
-    child_process: Option<Child>,
+    child_process: Option<ChildProcess>,
     status_detail: String,
     configuration_path: PathBuf,
     focus_handle: FocusHandle,
@@ -145,8 +128,8 @@ pub struct TrustTunnelApp {
     configuration_scroll_handle: ScrollHandle,
     configuration_scroll_anchors: [ScrollAnchor; 10],
     log_file: Option<Arc<Mutex<fs::File>>>,
-    system_proxy_set: bool,
-    resolvconf_set: bool,
+    proxy_overrides: Vec<Box<dyn ProxyBackend>>,
+    dns_override: Option<Box<dyn DnsBackend>>,
     binary_path: String,
     binary_found: bool,
     poll_tick: u32,
@@ -188,6 +171,7 @@ impl TrustTunnelApp {
             post_quantum_group_enabled: initialization.post_quantum_group_enabled,
             dns_enabled: initialization.dns_enabled,
             tunnel_mode: initialization.tunnel_mode,
+            system_services: initialization.system_services,
             connection_state: ConnectionState::Disconnected,
             child_process: None,
             status_detail: String::new(),
@@ -220,8 +204,8 @@ impl TrustTunnelApp {
             configuration_scroll_handle,
             configuration_scroll_anchors,
             log_file: None,
-            system_proxy_set: false,
-            resolvconf_set: false,
+            proxy_overrides: Vec::new(),
+            dns_override: None,
             binary_path: initialization.binary_path,
             binary_found: initialization.binary_found,
             poll_tick: 0,
@@ -249,18 +233,22 @@ impl TrustTunnelApp {
         directory
     }
 
-    fn cleanup_child(&mut self) -> Option<Child> {
-        if self.system_proxy_set {
+    fn cleanup_child(&mut self) -> Option<ChildProcess> {
+        if !self.proxy_overrides.is_empty() {
             log::info!("[cleanup] restoring system proxy");
-            clear_system_proxy();
-            self.system_proxy_set = false;
+            proxy::clear_all(&mut self.proxy_overrides);
+            self.proxy_overrides.clear();
         }
-        if self.resolvconf_set {
-            log::info!("[cleanup] restoring DNS via resolvconf");
-            clear_dns_resolvconf();
-            self.resolvconf_set = false;
+        if let Some(mut dns) = self.dns_override.take() {
+            log::info!("[cleanup] restoring DNS via {}", dns.name());
+            dns.clear();
         }
-        self.child_process.take()
+        let child = self.child_process.take()?;
+        #[cfg(target_os = "windows")]
+        if child.is_elevated() {
+            cleanup_elevated_files();
+        }
+        Some(child)
     }
 
     fn create_session_log_file(&self) -> Option<Arc<Mutex<fs::File>>> {
@@ -274,7 +262,7 @@ impl TrustTunnelApp {
         let sanitized_name: String = credential_name
             .chars()
             .map(|character| match character {
-                '/' | '\\' | '\0' => '_',
+                '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
                 _ => character,
             })
             .collect();
@@ -301,56 +289,200 @@ impl TrustTunnelApp {
         }
     }
 
-    fn send_terminate_signal(child: &Child) {
-        let pid_string = child.id().to_string();
-        if run_silent("kill", &["-INT", &pid_string]) {
-            log::info!("[terminate] sent SIGINT to pid={pid_string}");
+    fn send_terminate_signal(system_services: Arc<dyn SystemServices>, child: &mut ChildProcess) {
+        if child.is_elevated() {
+            log::info!("[terminate] killing elevated client");
+            child.kill();
+            return;
+        }
+        let Some(process_id) = child.id() else {
+            log::warn!("[terminate] no PID available, forcing kill");
+            child.kill();
+            return;
+        };
+        if system_services.terminate_process(process_id) {
+            log::info!("[terminate] sent terminate signal to pid={process_id}");
         } else {
-            log::info!("[terminate] SIGINT failed for pid={pid_string}, trying pkexec");
+            log::info!("[terminate] terminate failed for pid={process_id}, trying elevation");
             std::thread::spawn(move || {
-                run_silent("pkexec", &["kill", "-INT", &pid_string]);
+                system_services.elevate_terminate_process(process_id);
             });
         }
     }
 
-    fn kill_child_background(mut child: Child) {
-        let pid_string = child.id().to_string();
+    fn kill_child_background(&self, mut child: ChildProcess) {
+        let elevated = child.is_elevated();
+        let system_services = self.system_services.clone();
         std::thread::spawn(move || {
-            if run_silent("kill", &["-INT", &pid_string]) {
-                log::info!("[terminate] sent SIGINT to pid={pid_string}");
+            if elevated {
+                log::info!("[terminate] killing elevated client");
+                child.kill();
+                child.wait();
+                #[cfg(target_os = "windows")]
+                cleanup_elevated_files();
+                return;
+            }
+
+            let Some(process_id) = child.id() else {
+                log::warn!("[terminate] no PID available, forcing kill");
+                child.kill();
+                child.wait();
+                return;
+            };
+
+            if system_services.terminate_process(process_id) {
+                log::info!("[terminate] sent terminate signal to pid={process_id}");
             } else {
-                log::info!("[terminate] SIGINT failed for pid={pid_string}, trying pkexec");
-                run_silent("pkexec", &["kill", "-INT", &pid_string]);
+                log::info!("[terminate] terminate failed for pid={process_id}, trying elevation");
+                system_services.elevate_terminate_process(process_id);
             }
 
             let poll_interval = Duration::from_millis(100);
             let poll_count = GRACEFUL_SHUTDOWN_TIMEOUT.as_millis() / poll_interval.as_millis();
 
             for attempt in 0..poll_count {
-                if let Ok(Some(status)) = child.try_wait() {
-                    log::info!(
-                        "[terminate] child exited gracefully (attempt {attempt}, status={status})"
-                    );
+                if let Ok(Some(exit)) = child.try_wait() {
+                    log::info!("[terminate] child exited gracefully (attempt {attempt}, {exit})");
                     return;
                 }
                 std::thread::sleep(poll_interval);
             }
 
-            log::warn!("[terminate] graceful shutdown timed out for pid={pid_string}");
-            if child.kill().is_err() {
-                run_silent("pkexec", &["kill", "-KILL", &pid_string]);
-            }
-            match child.wait() {
-                Ok(status) => log::info!("[terminate] child reaped: {status}"),
-                Err(error) => log::warn!("[terminate] child wait error: {error}"),
-            }
+            log::warn!("[terminate] graceful shutdown timed out for pid={process_id}");
+            child.kill();
+            let exit = child.wait();
+            log::info!("[terminate] child reaped: {exit}");
         });
     }
 
-    fn start_log_reader(&self, child: &mut Child) {
+    #[cfg(target_os = "windows")]
+    fn kill_child_sync(&self, mut child: ChildProcess) {
+        let pid_label = child
+            .id()
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "elevated".into());
+        log::info!(
+            "[terminate] synchronously killing child (pid={pid_label}, elevated={})",
+            child.is_elevated(),
+        );
+        child.kill();
+        let deadline = Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT;
+        loop {
+            if let Ok(Some(exit)) = child.try_wait() {
+                log::info!("[terminate] child exited synchronously: {exit}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                log::warn!("[terminate] synchronous wait timed out for pid={pid_label}");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        cleanup_elevated_files();
+    }
+
+    fn start_log_reader(&self, child: &mut ChildProcess) {
         let log_file = self.log_file.clone();
 
-        if let Some(stderr) = child.stderr.take() {
+        #[cfg(target_os = "windows")]
+        if let Some(path) = child.elevated_log_path()
+            && let Some(exit_marker_base) = child.elevated_exit_marker_path()
+        {
+            let shared_log = self.process_log.clone();
+            let log_path = path.to_path_buf();
+            let exit_marker = exit_marker_base.to_path_buf();
+            std::thread::spawn(move || {
+                use std::io::Read;
+
+                let mut attempts = 0u32;
+                let file = loop {
+                    match fs::File::open(&log_path) {
+                        Ok(f) => break f,
+                        Err(_) if attempts < 40 => {
+                            attempts += 1;
+                            std::thread::sleep(Duration::from_millis(250));
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "[log_reader] failed to open elevated log {}: {error}",
+                                log_path.display(),
+                            );
+                            return;
+                        }
+                    }
+                };
+                let mut reader = BufReader::new(file);
+                let mut leftover = String::new();
+                let mut strip_bom = true;
+
+                loop {
+                    let mut chunk = String::new();
+                    match reader.read_to_string(&mut chunk) {
+                        Ok(0) => {} // no new data
+                        Ok(_) => {
+                            if strip_bom {
+                                strip_bom = false;
+                                if chunk.starts_with('\u{FEFF}') {
+                                    chunk.drain(..'\u{FEFF}'.len_utf8());
+                                }
+                            }
+                            let text = if leftover.is_empty() {
+                                chunk
+                            } else {
+                                std::mem::take(&mut leftover) + &chunk
+                            };
+                            let mut lines_iter = text.split('\n').peekable();
+                            while let Some(raw_line) = lines_iter.next() {
+                                if lines_iter.peek().is_none() && !text.ends_with('\n') {
+                                    leftover = raw_line.to_string();
+                                    break;
+                                }
+                                let line = raw_line.trim_end_matches('\r');
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                if let Some(ref log_file) = log_file
+                                    && let Ok(mut file) = log_file.lock()
+                                    && let Err(error) = writeln!(file, "{line}")
+                                {
+                                    log::warn!("[logs] failed to write line: {error}");
+                                }
+                                let Ok(mut locked_log) = shared_log.lock() else {
+                                    return;
+                                };
+                                locked_log.push_line(line.to_string());
+                            }
+                        }
+                        Err(error) => {
+                            log::trace!("[log_reader] read error: {error}");
+                        }
+                    }
+
+                    if exit_marker.exists() {
+                        std::thread::sleep(Duration::from_millis(500));
+                        let mut final_chunk = String::new();
+                        if let Ok(n) = reader.read_to_string(&mut final_chunk)
+                            && n > 0
+                            && let Ok(mut locked_log) = shared_log.lock()
+                        {
+                            let text = leftover + &final_chunk;
+                            for raw_line in text.lines() {
+                                let line = raw_line.trim_end_matches('\r');
+                                if !line.is_empty() {
+                                    locked_log.push_line(line.to_string());
+                                }
+                            }
+                        }
+                        break;
+                    }
+
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            });
+            return;
+        }
+
+        if let Some(stderr) = child.take_stderr() {
             let shared_log = self.process_log.clone();
             let log_file = log_file.clone();
             std::thread::spawn(move || {
@@ -364,56 +496,10 @@ impl TrustTunnelApp {
                             {
                                 log::warn!("[logs] failed to write stderr line: {error}");
                             }
-                            let lower = line.to_lowercase();
                             let Ok(mut locked_log) = shared_log.lock() else {
                                 break;
                             };
-
-                            if lower.contains("successfully connected to endpoint")
-                                || lower.contains("successfully connected")
-                                || lower.contains("socks listener started")
-                                || (lower.contains("listening") && lower.contains("socks"))
-                                || (lower.contains("socks") && lower.contains("bind"))
-                            {
-                                log::info!("[detect] connection confirmed: {line}");
-                                locked_log.connected = true;
-                            }
-
-                            if !locked_log.connected
-                                && !lower.contains("waiting recovery")
-                                && (lower.starts_with("error:")
-                                    || lower.contains("failed to")
-                                    || lower.contains("denied")
-                                    || lower.contains("unauthorized")
-                                    || lower.contains("refused")
-                                    || lower.contains("failed parsing")
-                                    || lower.contains("failed to start listening")
-                                    || lower.contains("failed to create listener")
-                                    || lower.contains("failed to initialize tunnel")
-                                    || lower.contains("couldn't detect active network")
-                                    || lower.contains("failed on create vpn"))
-                            {
-                                log::warn!("[detect] connect-phase error: {line}");
-                                locked_log.error = Some(line.clone());
-                            }
-
-                            if locked_log.connected
-                                && locked_log.post_connect_error.is_none()
-                                && (lower.contains("health check error")
-                                    || lower.contains("response: http/2.0 407")
-                                    || (lower.contains("authorization required")
-                                        && !lower.contains("proxy-authenticate"))
-                                    || (lower.contains("connection failed")
-                                        && lower.contains("socks")))
-                            {
-                                log::warn!("[detect] post-connect error: {line}");
-                                locked_log.post_connect_error = Some(line.clone());
-                            }
-
-                            locked_log.lines.push(line);
-                            if locked_log.lines.len() > 500 {
-                                locked_log.lines.remove(0);
-                            }
+                            locked_log.push_line(line);
                         }
                         Err(error) => {
                             log::trace!("[child stderr] reader ended: {error}");
@@ -426,7 +512,7 @@ impl TrustTunnelApp {
             log::warn!("[log_reader] no stderr pipe from child");
         }
 
-        if let Some(stdout) = child.stdout.take() {
+        if let Some(stdout) = child.take_stdout() {
             let shared_log = self.process_log.clone();
             let log_file = log_file.clone();
             std::thread::spawn(move || {
@@ -440,20 +526,10 @@ impl TrustTunnelApp {
                             {
                                 log::warn!("[logs] failed to write stdout line: {error}");
                             }
-                            let lower = line.to_lowercase();
                             let Ok(mut locked_log) = shared_log.lock() else {
                                 break;
                             };
-                            if lower.contains("successfully connected to endpoint")
-                                || lower.contains("successfully connected")
-                            {
-                                log::info!("[detect] connection confirmed (stdout): {line}");
-                                locked_log.connected = true;
-                            }
-                            locked_log.lines.push(line);
-                            if locked_log.lines.len() > 500 {
-                                locked_log.lines.remove(0);
-                            }
+                            locked_log.push_line(line);
                         }
                         Err(error) => {
                             log::trace!("[child stdout] reader ended: {error}");
@@ -487,49 +563,54 @@ impl TrustTunnelApp {
         }
     }
 
-    fn try_reap_child(&mut self) -> Option<std::process::ExitStatus> {
+    fn try_reap_child(&mut self) -> Option<ChildExit> {
         if let Some(ref mut child) = self.child_process
-            && let Ok(Some(status)) = child.try_wait()
+            && let Ok(Some(exit)) = child.try_wait()
         {
-            log::debug!("[poll] child exited with status: {status}");
-            return Some(status);
+            log::debug!("[poll] child exited with {exit}");
+            return Some(exit);
         }
         None
     }
 
-    fn handle_child_exit(&mut self, status: std::process::ExitStatus, context: &mut Context<Self>) {
-        self.child_process = None;
-        if self.system_proxy_set {
-            log::info!("[poll] restoring system proxy after client exit");
-            clear_system_proxy();
-            self.system_proxy_set = false;
+    fn handle_child_exit(&mut self, exit: ChildExit, context: &mut Context<Self>) {
+        #[cfg(target_os = "windows")]
+        if let Some(ref child) = self.child_process {
+            if child.is_elevated() {
+                cleanup_elevated_files();
+            }
         }
-        if self.resolvconf_set {
-            log::info!("[poll] restoring DNS via resolvconf after client exit");
-            clear_dns_resolvconf();
-            self.resolvconf_set = false;
+        self.child_process = None;
+        if !self.proxy_overrides.is_empty() {
+            log::info!("[poll] restoring system proxy after client exit");
+            proxy::clear_all(&mut self.proxy_overrides);
+            self.proxy_overrides.clear();
+        }
+        if let Some(mut dns) = self.dns_override.take() {
+            log::info!("[poll] restoring DNS via {} after client exit", dns.name());
+            dns.clear();
         }
         if matches!(self.connection_state, ConnectionState::Disconnecting) {
-            log::info!("[poll] child exited during disconnect: {status}");
+            log::info!("[poll] child exited during disconnect: {exit}");
             self.connection_state = ConnectionState::Disconnected;
             self.status_detail = String::new();
             context.notify();
             return;
         }
 
-        if status.success() {
+        if exit.success() {
             self.connection_state = ConnectionState::Disconnected;
             self.status_detail = String::new();
         } else {
-            let code = status
-                .code()
+            let code = exit
+                .code
                 .map(|exit_code| exit_code.to_string())
                 .unwrap_or_else(|| "signal".into());
 
-            let detail_message = if status.code() == Some(126) {
+            let detail_message = if exit.code == Some(126) {
                 "pkexec authentication was dismissed — try again and authenticate when prompted"
                     .to_string()
-            } else if status.code() == Some(127) {
+            } else if exit.code == Some(127) {
                 format!(
                     "Binary '{}' not found. Install TrustTunnel client:\n  \
                      https://github.com/TrustTunnel/TrustTunnelClient",
@@ -555,7 +636,7 @@ impl TrustTunnelApp {
             drop(locked_log);
 
             if let Some(child) = self.cleanup_child() {
-                Self::kill_child_background(child);
+                self.kill_child_background(child);
             }
 
             self.connection_state = ConnectionState::Error("Connection failed".into());
@@ -579,27 +660,47 @@ impl TrustTunnelApp {
         self.connection_state = ConnectionState::Connected;
 
         let mut proxy_detail = String::new();
-        if self.tunnel_mode.sets_system_proxy() && !self.system_proxy_set {
+        if self.tunnel_mode.sets_system_proxy() && self.proxy_overrides.is_empty() {
             let (host, port) = parse_host_port(PROXY_LISTEN_ADDRESS);
-            proxy_detail = set_system_proxy(&host, port);
-            self.system_proxy_set = true;
+            let (backends, detail) = proxy::set_all(&host, port);
+            proxy_detail = detail;
+            self.proxy_overrides = backends;
         }
 
-        if self.dns_enabled
+        // On Windows TUN mode the client binary itself manages DNS via the
+        // `change_system_dns` configuration flag, so the UI must not apply a
+        // second, redundant DNS override that would conflict on cleanup.
+        let ui_manages_dns = self.dns_enabled
             && self.tunnel_mode.is_tun()
-            && !check_systemd_resolved()
-            && !self.resolvconf_set
-            && check_resolvconf()
-        {
-            let dns_detail = set_dns_resolvconf();
-            self.resolvconf_set = true;
-            proxy_detail = dns_detail;
+            && self.dns_override.is_none()
+            && !cfg!(target_os = "windows");
+
+        if ui_manages_dns && let Some(mut backend) = dns::detect() {
+            let upstreams_text = self.dns_upstreams_input.read(context).text();
+            let upstreams: Vec<&str> = upstreams_text
+                .split(',')
+                .map(|s| s.trim().strip_prefix("tls://").unwrap_or(s.trim()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            match backend.set(&upstreams) {
+                Ok(dns_detail) => {
+                    proxy_detail = dns_detail;
+                    self.dns_override = Some(backend);
+                }
+                Err(dns_detail) => {
+                    log::warn!("[connect] DNS override failed: {dns_detail}");
+                    proxy_detail = dns_detail;
+                }
+            }
         }
 
         self.status_detail = match self.tunnel_mode {
             TunnelMode::Tun => {
-                if self.resolvconf_set {
-                    "TUN tunnel active (system-wide)\nDNS configured via resolvconf".into()
+                if let Some(ref dns) = self.dns_override {
+                    format!(
+                        "TUN tunnel active (system-wide)\nDNS configured via {}",
+                        dns.name(),
+                    )
                 } else {
                     "TUN tunnel active (system-wide)".into()
                 }
@@ -616,12 +717,22 @@ impl TrustTunnelApp {
                 lines
             }
             TunnelMode::Proxy => {
-                format!(
-                    "SOCKS5 proxy on {PROXY_LISTEN_ADDRESS}\n\
-                     Terminal: export ALL_PROXY=\"socks5://{PROXY_LISTEN_ADDRESS}\"\n\
-                     Firefox: Settings → Network → SOCKS5 Host: 127.0.0.1  Port: 1080\n\
-                     Chromium: --proxy-server=\"socks5://{PROXY_LISTEN_ADDRESS}\""
-                )
+                if cfg!(target_os = "windows") {
+                    format!(
+                        "SOCKS5 proxy on {PROXY_LISTEN_ADDRESS}\n\
+                         PowerShell: $env:ALL_PROXY=\"socks5://{PROXY_LISTEN_ADDRESS}\"\n\
+                         CMD: set ALL_PROXY=socks5://{PROXY_LISTEN_ADDRESS}\n\
+                         Firefox: Settings → Network → SOCKS5 Host: 127.0.0.1  Port: 1080\n\
+                         Chromium: --proxy-server=\"socks5://{PROXY_LISTEN_ADDRESS}\""
+                    )
+                } else {
+                    format!(
+                        "SOCKS5 proxy on {PROXY_LISTEN_ADDRESS}\n\
+                         Terminal: export ALL_PROXY=\"socks5://{PROXY_LISTEN_ADDRESS}\"\n\
+                         Firefox: Settings → Network → SOCKS5 Host: 127.0.0.1  Port: 1080\n\
+                         Chromium: --proxy-server=\"socks5://{PROXY_LISTEN_ADDRESS}\""
+                    )
+                }
             }
         };
         context.notify();
@@ -643,7 +754,7 @@ impl TrustTunnelApp {
 
         log::warn!("[poll] disconnect timeout, forcing kill");
         if let Some(child) = self.child_process.take() {
-            Self::kill_child_background(child);
+            self.kill_child_background(child);
         }
         self.connection_state = ConnectionState::Disconnected;
         self.status_detail = "Force disconnected (process did not exit in time)".into();
@@ -683,10 +794,9 @@ impl TrustTunnelApp {
             self.selected_credential = Some(0);
             self.load_credential(&CredentialFile::default(), context);
         } else {
-            self.selected_credential = Some(index.min(self.stored_credentials.len() - 1));
-            let credential = self.stored_credentials[self.selected_credential.unwrap()]
-                .credential
-                .clone();
+            let new_index = index.min(self.stored_credentials.len() - 1);
+            self.selected_credential = Some(new_index);
+            let credential = self.stored_credentials[new_index].credential.clone();
             self.load_credential(&credential, context);
         }
 
@@ -707,55 +817,68 @@ impl TrustTunnelApp {
 
         self.save_draft_credential(context);
 
-        let executor = context.background_executor().clone();
         let credentials_path = credentials_directory();
+        let receiver = context.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
 
-        context.spawn(async move |this: WeakEntity<Self>, context: &mut AsyncApp| {
-            let path = executor
-                .spawn(async move { open_file_dialog("Add Credentials", "TOML files", "*.toml") })
-                .await;
-
-            let Some(path) = path else {
-                return;
-            };
-
-            log::info!("[credentials] adding file: {}", path.display());
-
-            let destination = match add_credential_file(&path, &credentials_path) {
-                Ok(destination) => destination,
-                Err(error) => {
-                    if let Err(update_error) = this.update(context, |this, context| {
-                        this.status_detail = error;
-                        context.notify();
-                    }) {
-                        log::warn!("[credentials] failed to update state after import error: {update_error}");
+        context
+            .spawn(async move |this: WeakEntity<Self>, context: &mut AsyncApp| {
+                let path = match receiver.await {
+                    Ok(Ok(Some(paths))) => match paths.into_iter().next() {
+                        Some(path) => path,
+                        None => return,
+                    },
+                    Ok(Ok(None)) => return,
+                    Ok(Err(error)) => {
+                        log::warn!("[credentials] file dialog error: {error}");
+                        return;
                     }
-                    return;
-                }
-            };
+                    Err(_) => return,
+                };
 
-            if let Err(update_error) = this.update(context, |this, context| {
-                let saved_state = AppState::load();
-                this.stored_credentials = scan_credentials(&credentials_path);
-                crate::app_state::apply_saved_order(
-                    &mut this.stored_credentials,
-                    &saved_state.credential_order,
-                );
-                let found_index = this
-                    .stored_credentials
-                    .iter()
-                    .position(|entry| entry.path == destination);
-                if let Some(selected_index) = found_index {
-                    this.select_credential(selected_index, context);
+                log::info!("[credentials] adding file: {}", path.display());
+
+                let destination = match add_credential_file(&path, &credentials_path) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        if let Err(update_error) = this.update(context, |this, context| {
+                            this.status_detail = error;
+                            context.notify();
+                        }) {
+                            log::warn!("[credentials] failed to update state after import error: {update_error}");
+                        }
+                        return;
+                    }
+                };
+
+                if let Err(update_error) = this.update(context, |this, context| {
+                    let saved_state = AppState::load();
+                    this.stored_credentials = scan_credentials(&credentials_path);
+                    crate::app_state::apply_saved_order(
+                        &mut this.stored_credentials,
+                        &saved_state.credential_order,
+                    );
+                    let found_index = this
+                        .stored_credentials
+                        .iter()
+                        .position(|entry| entry.path == destination);
+                    if let Some(selected_index) = found_index {
+                        this.select_credential(selected_index, context);
+                    }
+                    this.sync_credential_focus_handles(context);
+                    this.save_app_state();
+                    context.notify();
+                }) {
+                    log::warn!(
+                        "[credentials] failed to update state after import: {update_error}"
+                    );
                 }
-                this.sync_credential_focus_handles(context);
-                this.save_app_state();
-                context.notify();
-            }) {
-                log::warn!("[credentials] failed to update state after import: {update_error}");
-            }
-        })
-        .detach();
+            })
+            .detach();
     }
 
     fn add_credential(
@@ -1057,100 +1180,75 @@ impl TrustTunnelApp {
 
         if !self.binary_found {
             self.connection_state = ConnectionState::Error("Client binary not found".into());
-            self.status_detail =
+            self.status_detail = if cfg!(target_os = "windows") {
+                "Could not find 'trusttunnel_client.exe' in PATH or standard locations.\n\n\
+                 Install the TrustTunnel client:\n  \
+                 https://github.com/TrustTunnel/TrustTunnelClient"
+            } else {
                 "Could not find 'trusttunnel_client' in PATH or standard locations.\n\n\
                  Install the TrustTunnel client:\n  \
                  https://github.com/TrustTunnel/TrustTunnelClient"
-                    .to_string();
+            }
+            .to_string();
             context.notify();
             return;
         }
 
-        if mode.is_tun() && !check_tun_device() {
+        if mode.is_tun() && !self.system_services.check_tun_device() {
             self.connection_state = ConnectionState::Error("TUN device not available".into());
-            self.status_detail = "/dev/net/tun not found. Load the tun kernel module:\n  \
-                 sudo modprobe tun\n\n\
-                 To make it persistent, add 'tun' to /etc/modules-load.d/tun.conf"
-                .into();
+            #[cfg(target_os = "linux")]
+            {
+                self.status_detail = "/dev/net/tun not found. Load the tun kernel module:\n  \
+                     sudo modprobe tun\n\n\
+                     To make it persistent, add 'tun' to /etc/modules-load.d/tun.conf"
+                    .into();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                self.status_detail =
+                    "wintun.dll not found. TUN mode requires the Wintun driver.\n\n\
+                     Download wintun.dll from https://www.wintun.net and place it\n\
+                     next to trusttunnel-ui.exe or in C:\\Windows\\System32."
+                        .into();
+            }
             context.notify();
             return;
         }
 
-        if mode.is_tun() && !check_pkexec() {
-            self.connection_state = ConnectionState::Error("pkexec not found".into());
-            self.status_detail = "pkexec is required for TUN mode (root privileges needed).\n\
-                 Install policykit-1 or try Proxy/System Proxy mode instead."
-                .into();
+        if mode.is_tun() && !self.system_services.check_elevation_available() {
+            self.connection_state =
+                ConnectionState::Error("Privilege elevation unavailable".into());
+            #[cfg(target_os = "linux")]
+            {
+                self.status_detail = "pkexec is required for TUN mode (root privileges needed).\n\
+                     Install policykit-1 or try Proxy/System Proxy mode instead."
+                    .into();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                self.status_detail = "Administrator privileges are required for TUN mode.\n\
+                     Run TrustTunnel UI as Administrator or try Proxy/System Proxy mode instead."
+                    .into();
+            }
             context.notify();
             return;
         }
 
         if let Some(child) = self.cleanup_child() {
-            Self::kill_child_background(child);
+            self.kill_child_background(child);
         }
 
-        let hostname = self.hostname_input.read(context).text().trim().to_string();
-        let addresses_raw = self.addresses_input.read(context).text().trim().to_string();
-        let username = self.username_input.read(context).text().trim().to_string();
-        let password = self.password_input.read(context).text();
-        let certificate = self
-            .certificate_input
-            .read(context)
-            .text()
-            .trim()
-            .to_string();
-        let dns_upstreams_raw = self
-            .dns_upstreams_input
-            .read(context)
-            .text()
-            .trim()
-            .to_string();
-        let dns_upstreams: Vec<String> = dns_upstreams_raw
-            .split([',', ' '])
-            .map(|segment| segment.trim().to_string())
-            .filter(|segment| !segment.is_empty())
-            .collect();
+        let credential = self.build_credential_from_fields(context);
 
-        if let Some(error) = Self::validate_fields(&hostname, &addresses_raw, &username, &password)
-        {
+        if let Some(error) = credential.validate() {
             self.connection_state = ConnectionState::Error(error.0.clone());
             self.status_detail = error.1.clone();
             context.notify();
             return;
         }
 
-        let addresses: Vec<String> = addresses_raw
-            .split([',', ' '])
-            .map(|segment| segment.trim().to_string())
-            .filter(|segment| !segment.is_empty())
-            .map(|address| {
-                if address.contains(':') {
-                    address
-                } else {
-                    format!("{address}:443")
-                }
-            })
-            .collect();
-
-        let mut configuration = VpnConfiguration::new(
-            EndpointFields {
-                hostname,
-                addresses,
-                has_ipv6: self.has_ipv6,
-                username,
-                password,
-                skip_verification: self.skip_verification,
-                certificate,
-                upstream_protocol: self.upstream_protocol.clone(),
-                upstream_fallback_protocol: self.upstream_fallback_protocol.clone(),
-                anti_dpi: self.anti_dpi,
-                killswitch_enabled: self.killswitch_enabled,
-                post_quantum_group_enabled: self.post_quantum_group_enabled,
-                dns_enabled: self.dns_enabled,
-                dns_upstreams,
-            },
-            mode,
-        );
+        let endpoint = credential.to_endpoint_fields(self.dns_enabled);
+        let mut configuration = VpnConfiguration::new(endpoint, mode);
 
         if mode.is_tun()
             && let Some(ref mut tun) = configuration.listener.tun
@@ -1203,44 +1301,22 @@ impl TrustTunnelApp {
         self.connection_state = ConnectionState::Connecting;
         context.notify();
 
-        let binary = &self.binary_path;
-        let configuration_path = &self.configuration_path;
-
-        let spawn_result = if mode.is_tun() {
-            log::info!(
-                "[connect] spawning: pkexec {} -c {}",
-                binary,
-                configuration_path.display(),
-            );
-            Command::new("pkexec")
-                .arg(binary)
-                .arg("-c")
-                .arg(configuration_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-        } else {
-            log::info!(
-                "[connect] spawning: {} -c {}",
-                binary,
-                configuration_path.display(),
-            );
-            Command::new(binary)
-                .arg("-c")
-                .arg(configuration_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-        };
+        let spawn_result = self.system_services.spawn_client(
+            &self.binary_path,
+            &self.configuration_path,
+            mode.is_tun(),
+        );
 
         match spawn_result {
             Ok(mut child) => {
+                let pid_label = child
+                    .id()
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "elevated".into());
                 log::info!(
-                    "[connect] child started (pid={}, mode={})",
-                    child.id(),
+                    "[connect] child started (pid={pid_label}, mode={}, elevated={})",
                     mode.label(),
+                    child.is_elevated(),
                 );
                 self.start_log_reader(&mut child);
                 self.child_process = Some(child);
@@ -1258,56 +1334,28 @@ impl TrustTunnelApp {
         context.notify();
     }
 
-    fn validate_fields(
-        hostname: &str,
-        addresses: &str,
-        username: &str,
-        password: &str,
-    ) -> Option<(String, String)> {
-        if addresses.is_empty() {
-            return Some((
-                "Addresses required".into(),
-                "Enter at least one endpoint address (e.g. 78.141.223.149:443)".into(),
-            ));
-        }
-        if hostname.is_empty() {
-            return Some((
-                "Hostname is required".into(),
-                "Enter the endpoint hostname (e.g. vpn.example.com)".into(),
-            ));
-        }
-        if username.is_empty() {
-            return Some(("Username is required".into(), "Enter your username".into()));
-        }
-        if password.is_empty() {
-            return Some(("Password is required".into(), "Enter your password".into()));
-        }
-        None
-    }
-
     fn disconnect(&mut self, _: &Disconnect, _window: &mut Window, context: &mut Context<Self>) {
         if matches!(self.connection_state, ConnectionState::Disconnecting) {
             return;
         }
         log::info!("━━━ DISCONNECT ━━━");
 
-        if self.system_proxy_set {
+        if !self.proxy_overrides.is_empty() {
             log::info!("[disconnect] restoring system proxy");
-            clear_system_proxy();
-            self.system_proxy_set = false;
+            proxy::clear_all(&mut self.proxy_overrides);
+            self.proxy_overrides.clear();
         }
-        if self.resolvconf_set {
-            log::info!("[disconnect] restoring DNS via resolvconf");
-            clear_dns_resolvconf();
-            self.resolvconf_set = false;
+        if let Some(mut dns) = self.dns_override.take() {
+            log::info!("[disconnect] restoring DNS via {}", dns.name());
+            dns.clear();
         }
 
         if let Some(ref mut child) = self.child_process {
-            if let Ok(Some(status)) = child.try_wait() {
-                log::info!("[disconnect] child already exited: {status}");
+            if let Ok(Some(exit)) = child.try_wait() {
+                log::info!("[disconnect] child already exited: {exit}");
                 self.child_process = None;
                 self.connection_state = ConnectionState::Disconnected;
-                self.status_detail = format!("Client already exited ({status})");
+                self.status_detail = format!("Client already exited ({exit})");
                 context.notify();
                 return;
             }
@@ -1315,7 +1363,8 @@ impl TrustTunnelApp {
             self.connection_state = ConnectionState::Disconnecting;
             self.status_detail = String::new();
             self.disconnecting_since = Some(Instant::now());
-            Self::send_terminate_signal(child);
+            let system_services = self.system_services.clone();
+            Self::send_terminate_signal(system_services, child);
             context.notify();
         } else {
             self.connection_state = ConnectionState::Disconnected;
@@ -1534,7 +1583,13 @@ impl TrustTunnelApp {
         log::info!("[quit] shutting down");
         self.save_draft_credential(context);
         if let Some(child) = self.cleanup_child() {
-            Self::kill_child_background(child);
+            #[cfg(target_os = "windows")]
+            if child.is_elevated() {
+                self.kill_child_sync(child);
+                context.quit();
+                return;
+            }
+            self.kill_child_background(child);
         }
         context.quit();
     }
@@ -1543,8 +1598,16 @@ impl TrustTunnelApp {
 impl Drop for TrustTunnelApp {
     fn drop(&mut self) {
         log::info!("[drop] TrustTunnelApp shutting down");
+        self.save_app_state();
+        // cleanup_child() already restores system proxy and DNS override,
+        // so no need to duplicate that logic here.
         if let Some(child) = self.cleanup_child() {
-            Self::kill_child_background(child);
+            #[cfg(target_os = "windows")]
+            if child.is_elevated() {
+                self.kill_child_sync(child);
+                return;
+            }
+            self.kill_child_background(child);
         }
     }
 }
@@ -1555,8 +1618,40 @@ impl Focusable for TrustTunnelApp {
     }
 }
 
+fn resize_edge(position: Point<Pixels>, inset: Pixels, size: Size<Pixels>) -> Option<ResizeEdge> {
+    let edge = if position.y < inset && position.x < inset {
+        ResizeEdge::TopLeft
+    } else if position.y < inset && position.x > size.width - inset {
+        ResizeEdge::TopRight
+    } else if position.y < inset {
+        ResizeEdge::Top
+    } else if position.y > size.height - inset && position.x < inset {
+        ResizeEdge::BottomLeft
+    } else if position.y > size.height - inset && position.x > size.width - inset {
+        ResizeEdge::BottomRight
+    } else if position.y > size.height - inset {
+        ResizeEdge::Bottom
+    } else if position.x < inset {
+        ResizeEdge::Left
+    } else if position.x > size.width - inset {
+        ResizeEdge::Right
+    } else {
+        return None;
+    };
+    Some(edge)
+}
+
+fn resize_cursor(edge: ResizeEdge) -> CursorStyle {
+    match edge {
+        ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
+        ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
+        ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorStyle::ResizeUpLeftDownRight,
+        ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
+    }
+}
+
 impl Render for TrustTunnelApp {
-    fn render(&mut self, _window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
         if self.connection_state.is_active() {
             self.poll_process_state(context);
         }
@@ -1606,7 +1701,15 @@ impl Render for TrustTunnelApp {
         let upstream = self.upstream_protocol.clone();
         let fallback = self.upstream_fallback_protocol.clone();
 
-        div()
+        let decorations = window.window_decorations();
+        let resize_border = px(5.0);
+        let border_color = rgb(BORDER);
+        let show_controls = match decorations {
+            Decorations::Client { .. } => true,
+            Decorations::Server => cfg!(target_os = "windows"),
+        };
+
+        let content = div()
             .key_context("TrustTunnelApp")
             .track_focus(&self.focus_handle(context))
             .on_action(context.listener(Self::connect))
@@ -1622,7 +1725,7 @@ impl Render for TrustTunnelApp {
             .flex_col()
             .size_full()
             .bg(rgb(SURFACE))
-            .child(self.render_titlebar(context))
+            .child(self.render_titlebar(show_controls, context))
             .child(
                 div()
                     .flex()
@@ -1663,7 +1766,7 @@ impl Render for TrustTunnelApp {
                                             .anchor_scroll(Some(
                                                 self.configuration_scroll_anchors[0].clone(),
                                             ))
-                                            .child(field("Hostname", &self.hostname_input)),
+                                            .child(field("Hostname", self.hostname_input.clone())),
                                     )
                                     .child(
                                         div()
@@ -1673,7 +1776,7 @@ impl Render for TrustTunnelApp {
                                             ))
                                             .child(field(
                                                 "Addresses (comma-separated)",
-                                                &self.addresses_input,
+                                                self.addresses_input.clone(),
                                             )),
                                     )
                                     .child(
@@ -1682,7 +1785,7 @@ impl Render for TrustTunnelApp {
                                             .anchor_scroll(Some(
                                                 self.configuration_scroll_anchors[2].clone(),
                                             ))
-                                            .child(field("Username", &self.username_input)),
+                                            .child(field("Username", self.username_input.clone())),
                                     )
                                     .child(
                                         div()
@@ -1690,7 +1793,7 @@ impl Render for TrustTunnelApp {
                                             .anchor_scroll(Some(
                                                 self.configuration_scroll_anchors[3].clone(),
                                             ))
-                                            .child(field("Password", &self.password_input)),
+                                            .child(field("Password", self.password_input.clone())),
                                     ),
                             )
                             .child(
@@ -1699,7 +1802,10 @@ impl Render for TrustTunnelApp {
                                     .anchor_scroll(Some(
                                         self.configuration_scroll_anchors[4].clone(),
                                     ))
-                                    .child(self.render_certificate_section()),
+                                    .child(field(
+                                        "Certificate (PEM)",
+                                        self.certificate_input.clone(),
+                                    )),
                             )
                             .child(
                                 div()
@@ -1709,7 +1815,7 @@ impl Render for TrustTunnelApp {
                                     ))
                                     .child(field(
                                         "DNS Upstreams (comma-separated)",
-                                        &self.dns_upstreams_input,
+                                        self.dns_upstreams_input.clone(),
                                     )),
                             )
                             .child(
@@ -1784,12 +1890,77 @@ impl Render for TrustTunnelApp {
                                     ),
                             ),
                     ),
+            );
+
+        div()
+            .id("window-backdrop")
+            .bg(transparent_black())
+            .size_full()
+            .map(|backdrop| match decorations {
+                Decorations::Server => backdrop,
+                Decorations::Client { tiling } => backdrop
+                    .child(
+                        canvas(
+                            |_bounds, window, _cx| {
+                                window.insert_hitbox(
+                                    Bounds::new(
+                                        point(px(0.0), px(0.0)),
+                                        window.window_bounds().get_bounds().size,
+                                    ),
+                                    HitboxBehavior::Normal,
+                                )
+                            },
+                            move |_bounds, hitbox, window, _cx| {
+                                let mouse = window.mouse_position();
+                                let size = window.window_bounds().get_bounds().size;
+                                if let Some(edge) = resize_edge(mouse, resize_border, size) {
+                                    window.set_cursor_style(resize_cursor(edge), &hitbox);
+                                }
+                            },
+                        )
+                        .size_full()
+                        .absolute(),
+                    )
+                    .when(!tiling.top, |d| d.pt(resize_border))
+                    .when(!tiling.bottom, |d| d.pb(resize_border))
+                    .when(!tiling.left, |d| d.pl(resize_border))
+                    .when(!tiling.right, |d| d.pr(resize_border))
+                    .on_mouse_move(|_, window, _| window.refresh())
+                    .on_mouse_down(MouseButton::Left, move |e, window, _| {
+                        let size = window.window_bounds().get_bounds().size;
+                        match resize_edge(e.position, resize_border, size) {
+                            Some(edge) => window.start_window_resize(edge),
+                            None => window.start_window_move(),
+                        }
+                    }),
+            })
+            .child(
+                div()
+                    .size_full()
+                    .overflow_hidden()
+                    .cursor(CursorStyle::Arrow)
+                    .map(|frame| match decorations {
+                        Decorations::Server => frame,
+                        Decorations::Client { tiling } => frame
+                            .border_color(border_color)
+                            .when(!tiling.top, |d| d.border_t_1())
+                            .when(!tiling.bottom, |d| d.border_b_1())
+                            .when(!tiling.left, |d| d.border_l_1())
+                            .when(!tiling.right, |d| d.border_r_1()),
+                    })
+                    .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(content),
             )
     }
 }
 
 impl TrustTunnelApp {
-    fn render_titlebar(&self, context: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(
+        &self,
+        show_controls: bool,
+        context: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_row()
@@ -1799,16 +1970,46 @@ impl TrustTunnelApp {
             .bg(rgb(TITLEBAR_BACKGROUND))
             .child(
                 titlebar_title("TrustTunnel")
+                    .window_control_area(WindowControlArea::Drag)
                     .cursor(CursorStyle::default())
                     .on_mouse_down(
                         MouseButton::Left,
-                        context.listener(|_, _, window, _| window.start_window_move()),
+                        context.listener(|_, event: &MouseDownEvent, window, _| {
+                            if event.click_count == 2 {
+                                window.zoom_window();
+                            } else {
+                                window.start_window_move();
+                            }
+                        }),
                     ),
             )
-            .child(titlebar_close().on_mouse_up(
-                MouseButton::Left,
-                context.listener(|this, _, window, context| this.quit(&Quit, window, context)),
-            ))
+            .when(show_controls, |titlebar| {
+                titlebar.child(
+                    titlebar_button("titlebar-minimize", "Minimize", false)
+                        .window_control_area(WindowControlArea::Min)
+                        .on_mouse_up(MouseButton::Left, |_, window: &mut Window, _| {
+                            window.minimize_window();
+                        }),
+                )
+            })
+            .when(show_controls, |titlebar| {
+                titlebar.child(
+                    titlebar_button("titlebar-maximize", "Maximize", false)
+                        .window_control_area(WindowControlArea::Max)
+                        .on_mouse_up(MouseButton::Left, |_, window: &mut Window, _| {
+                            window.zoom_window();
+                        }),
+                )
+            })
+            .child(
+                titlebar_button("titlebar-close", "Exit", true)
+                    .window_control_area(WindowControlArea::Close)
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        context
+                            .listener(|this, _, window, context| this.quit(&Quit, window, context)),
+                    ),
+            )
     }
 
     fn render_credential_list(
@@ -1944,16 +2145,6 @@ impl TrustTunnelApp {
                             ),
                     ),
             )
-    }
-
-    fn render_certificate_section(&self) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(GAP_EXTRA_SMALL))
-            .w_full()
-            .child(label("Certificate (PEM)"))
-            .child(self.certificate_input.clone())
     }
 
     fn render_endpoint_toggles(

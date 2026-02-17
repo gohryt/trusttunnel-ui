@@ -2,8 +2,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::system::check_systemd_resolved;
-
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct CredentialFile {
     #[serde(default)]
@@ -101,14 +99,27 @@ impl StoredCredential {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-        let path = directory.join(format!("{name}.toml"));
+        let new_path = directory.join(format!("{name}.toml"));
+        let old_path = self.path.clone();
 
         let content = toml::to_string_pretty(&self.credential)
             .map_err(|error| format!("Failed to serialize credential: {error}"))?;
-        std::fs::write(&path, &content)
-            .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
+        std::fs::write(&new_path, &content)
+            .map_err(|error| format!("Failed to write {}: {error}", new_path.display()))?;
 
-        self.path = path;
+        // Remove the old file if the path changed (e.g. draft → named credential)
+        // to avoid leaving stale files that scan_credentials would pick up.
+        if old_path != new_path
+            && old_path.exists()
+            && let Err(error) = std::fs::remove_file(&old_path)
+        {
+            log::warn!(
+                "[credentials] failed to remove old file {}: {error}",
+                old_path.display(),
+            );
+        }
+
+        self.path = new_path;
         self.name = name;
         self.draft = false;
         Ok(())
@@ -321,6 +332,66 @@ pub struct EndpointFields {
     pub dns_upstreams: Vec<String>,
 }
 
+impl CredentialFile {
+    pub fn validate(&self) -> Option<(String, String)> {
+        if self.addresses.is_empty() {
+            return Some((
+                "Addresses required".into(),
+                "Enter at least one endpoint address (e.g. 78.141.223.149:443)".into(),
+            ));
+        }
+        if self.hostname.is_empty() {
+            return Some((
+                "Hostname is required".into(),
+                "Enter the endpoint hostname (e.g. vpn.example.com)".into(),
+            ));
+        }
+        if self.username.is_empty() {
+            return Some(("Username is required".into(), "Enter your username".into()));
+        }
+        if self.password.is_empty() {
+            return Some(("Password is required".into(), "Enter your password".into()));
+        }
+        None
+    }
+
+    /// Addresses that lack an explicit port get `:443` appended.
+    pub fn to_endpoint_fields(&self, dns_enabled: bool) -> EndpointFields {
+        let addresses = self
+            .addresses
+            .iter()
+            .map(|address| {
+                if address.contains(':') {
+                    address.clone()
+                } else {
+                    format!("{address}:443")
+                }
+            })
+            .collect();
+
+        EndpointFields {
+            hostname: self.hostname.clone(),
+            addresses,
+            has_ipv6: self.has_ipv6,
+            username: self.username.clone(),
+            password: self.password.clone(),
+            skip_verification: self.skip_verification,
+            certificate: self.certificate.clone(),
+            upstream_protocol: if self.upstream_protocol.is_empty() {
+                "http2".into()
+            } else {
+                self.upstream_protocol.clone()
+            },
+            upstream_fallback_protocol: self.upstream_fallback_protocol.clone(),
+            anti_dpi: self.anti_dpi,
+            killswitch_enabled: self.killswitch_enabled,
+            post_quantum_group_enabled: self.post_quantum_group_enabled,
+            dns_enabled,
+            dns_upstreams: self.dns_upstreams.clone(),
+        }
+    }
+}
+
 impl VpnConfiguration {
     pub fn new(endpoint: EndpointFields, mode: TunnelMode) -> Self {
         log::debug!(
@@ -349,7 +420,7 @@ impl VpnConfiguration {
                         "224.0.0.0/3".into(),
                     ],
                     mtu_size: 1280,
-                    change_system_dns: endpoint.dns_enabled && check_systemd_resolved(),
+                    change_system_dns: endpoint.dns_enabled && cfg!(target_os = "windows"),
                 }),
                 proxy: None,
             }

@@ -1,17 +1,25 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod app;
 mod app_state;
 mod components;
 mod configuration;
+mod connection_state;
 mod log_panel;
-mod state;
+mod process_log;
+#[cfg(target_os = "windows")]
+mod single_instance;
 mod system;
 mod text_area;
 mod text_input;
 mod theme;
 
 use gpui::{
-    Application, Bounds, KeyBinding, WindowBackgroundAppearance, WindowBounds, WindowOptions,
-    prelude::*, px, size,
+    Application, Bounds, KeyBinding, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
+    WindowOptions, prelude::*, px, size,
 };
 
 use crate::{
@@ -39,11 +47,37 @@ fn main() {
     .init();
 
     log::info!(
-        "trusttunnel-ui v{} starting (RUST_LOG={})",
+        "trusttunnel-ui {} starting (RUST_LOG={})",
         env!("CARGO_PKG_VERSION"),
         std::env::var("RUST_LOG").unwrap_or_else(|_| "<default: info>".into()),
     );
 
+    let system_services = system::system_services();
+
+    {
+        let default_hook = std::panic::take_hook();
+        let system_services = system_services.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            log::error!("[panic] application panicked, performing emergency cleanup");
+
+            system_services.emergency_cleanup();
+
+            default_hook(info);
+        }));
+    }
+
+    #[cfg(target_os = "windows")]
+    let _single_instance_guard = match single_instance::acquire() {
+        Some(guard) => guard,
+        None => {
+            log::warn!("[startup] another instance is already running — exiting");
+            #[cfg(not(debug_assertions))]
+            single_instance::show_already_running_message();
+            return;
+        }
+    };
+
+    #[cfg(target_os = "linux")]
     log::info!(
         "[env] XDG_CURRENT_DESKTOP={}, XDG_SESSION_TYPE={}, DISPLAY={}, WAYLAND_DISPLAY={}",
         std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
@@ -52,14 +86,23 @@ fn main() {
         std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
     );
 
-    let (binary_path, binary_found) = system::find_client_binary();
+    #[cfg(target_os = "windows")]
+    log::info!(
+        "[env] OS={}, COMPUTERNAME={}",
+        std::env::var("OS").unwrap_or_default(),
+        std::env::var("COMPUTERNAME").unwrap_or_default(),
+    );
+
+    system_services.startup_cleanup();
+
+    let (binary_path, binary_found) = system_services.find_client_binary();
     log::info!(
         "[startup] client binary: {} (found={})",
         binary_path,
         binary_found,
     );
 
-    if binary_found && let Some(error) = system::check_binary_works(&binary_path, false) {
+    if binary_found && let Some(error) = system_services.check_binary_works(&binary_path, false) {
         log::warn!("[startup] binary check issue: {error}");
     }
 
@@ -71,6 +114,7 @@ fn main() {
     let saved_tunnel_mode = saved_state.tunnel_mode();
     let saved_dns_enabled = saved_state.dns_enabled();
     let saved_selected_credential = saved_state.find_selected_index(&stored_credentials);
+    let system_services = system_services.clone();
 
     Application::new().run(move |context| {
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), context);
@@ -92,7 +136,11 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: None,
+                is_resizable: true,
+                is_minimizable: true,
                 window_background: WindowBackgroundAppearance::Opaque,
+                window_min_size: Some(size(px(640.0), px(480.0))),
+                window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
             |_, context| {
@@ -195,6 +243,7 @@ fn main() {
                             post_quantum_group_enabled,
                             dns_enabled: saved_dns_enabled,
                             configuration_path: configuration_path.clone(),
+                            system_services: system_services.clone(),
                             log_panel,
                             binary_path: binary_path_clone,
                             binary_found,
@@ -211,6 +260,13 @@ fn main() {
         match window {
             Ok(window) => {
                 if let Err(error) = window.update(context, |view, window, context| {
+                    window.set_window_title("TrustTunnel");
+
+                    window.on_window_should_close(context, |_window, _cx| {
+                        log::info!("[close] window close requested by platform");
+                        true
+                    });
+
                     let handle = view.hostname_input(context);
                     window.focus(&handle, context);
                     context.activate(true);
