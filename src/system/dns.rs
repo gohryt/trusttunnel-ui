@@ -1,3 +1,9 @@
+#[cfg(target_os = "linux")]
+use super::{resolvconf, resolved, run_silent, run_silent_with_output};
+
+#[cfg(target_os = "windows")]
+use super::{powershell_dns, run_silent};
+
 pub const DEFAULT_DNS_SERVERS: &[&str] = &["1.1.1.1", "1.0.0.1"];
 
 pub trait DnsBackend: Send {
@@ -11,8 +17,6 @@ pub trait DnsBackend: Send {
 
 #[cfg(target_os = "linux")]
 pub fn detect() -> Option<Box<dyn DnsBackend>> {
-    use super::{resolvconf, resolved};
-
     if resolved::is_available() {
         log::info!("[dns] selected backend: systemd-resolved");
         return Some(Box::new(resolved::ResolvedDns::new()));
@@ -29,8 +33,6 @@ pub fn detect() -> Option<Box<dyn DnsBackend>> {
 
 #[cfg(target_os = "windows")]
 pub fn detect() -> Option<Box<dyn DnsBackend>> {
-    use super::powershell_dns;
-
     if powershell_dns::is_available() {
         log::info!("[dns] selected backend: PowerShell");
         return Some(Box::new(powershell_dns::PowerShellDns::new()));
@@ -42,8 +44,6 @@ pub fn detect() -> Option<Box<dyn DnsBackend>> {
 
 #[cfg(target_os = "linux")]
 pub fn emergency_clear() {
-    use super::{run_silent, run_silent_with_output};
-
     log::error!("[dns] emergency cleanup — attempting all known backends");
 
     let (ok, output) = run_silent_with_output("ip", &["-o", "link", "show", "type", "tun"]);
@@ -72,8 +72,6 @@ pub fn emergency_clear() {
 
 #[cfg(target_os = "windows")]
 pub fn emergency_clear() {
-    use super::run_silent;
-
     log::error!("[dns] emergency cleanup — restoring DNS via PowerShell");
 
     let script = r#"Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*TUN*' -and $_.InterfaceDescription -notlike '*TAP*' -and $_.InterfaceDescription -notlike '*Loopback*'} | ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ResetServerAddresses }"#;

@@ -255,19 +255,19 @@ impl ProxyBackend for KdeProxy {
     fn set(&mut self, host: &str, port: u16) -> Result<String, String> {
         let kwriteconfig = Self::kwriteconfig_command();
         let kioslaverc = Self::kioslaverc_path();
-        let kioslaverc_str = kioslaverc.to_string_lossy().to_string();
+        let kioslaverc_string = kioslaverc.to_string_lossy().to_string();
         let proxy_url = format!("socks5://{host}:{port}");
 
         log::info!(
             "[proxy] KDE: setting SOCKS5 proxy to {proxy_url} \
-             (kwriteconfig={kwriteconfig}, kioslaverc={kioslaverc_str})",
+             (kwriteconfig={kwriteconfig}, kioslaverc={kioslaverc_string})",
         );
 
         run_silent(
             kwriteconfig,
             &[
                 "--file",
-                &kioslaverc_str,
+                &kioslaverc_string,
                 "--group",
                 "Proxy Settings",
                 "--key",
@@ -279,7 +279,7 @@ impl ProxyBackend for KdeProxy {
             kwriteconfig,
             &[
                 "--file",
-                &kioslaverc_str,
+                &kioslaverc_string,
                 "--group",
                 "Proxy Settings",
                 "--key",
@@ -292,7 +292,7 @@ impl ProxyBackend for KdeProxy {
                 kwriteconfig,
                 &[
                     "--file",
-                    &kioslaverc_str,
+                    &kioslaverc_string,
                     "--group",
                     "Proxy Settings",
                     "--key",
@@ -305,7 +305,7 @@ impl ProxyBackend for KdeProxy {
             kwriteconfig,
             &[
                 "--file",
-                &kioslaverc_str,
+                &kioslaverc_string,
                 "--group",
                 "Proxy Settings",
                 "--key",
@@ -325,13 +325,13 @@ impl ProxyBackend for KdeProxy {
 
         let kwriteconfig = Self::kwriteconfig_command();
         let kioslaverc = Self::kioslaverc_path();
-        let kioslaverc_str = kioslaverc.to_string_lossy().to_string();
+        let kioslaverc_string = kioslaverc.to_string_lossy().to_string();
 
         run_silent(
             kwriteconfig,
             &[
                 "--file",
-                &kioslaverc_str,
+                &kioslaverc_string,
                 "--group",
                 "Proxy Settings",
                 "--key",

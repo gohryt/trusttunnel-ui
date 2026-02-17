@@ -14,6 +14,8 @@ pub struct AppState {
     pub tunnel_mode: Option<String>,
     #[serde(default = "default_dns_enabled")]
     pub dns_enabled: bool,
+    #[serde(default)]
+    pub selected_client_version: Option<String>,
 }
 
 fn default_dns_enabled() -> bool {
@@ -27,6 +29,7 @@ impl Default for AppState {
             selected_credential: None,
             tunnel_mode: None,
             dns_enabled: true,
+            selected_client_version: None,
         }
     }
 }
@@ -86,6 +89,14 @@ impl AppState {
 
     pub fn dns_enabled(&self) -> bool {
         self.dns_enabled
+    }
+
+    pub fn selected_client_version(&self) -> Option<&str> {
+        self.selected_client_version.as_deref()
+    }
+
+    pub fn set_selected_client_version(&mut self, version: Option<&str>) {
+        self.selected_client_version = version.map(|v| v.to_string());
     }
 
     pub fn set_dns_enabled(&mut self, enabled: bool) {

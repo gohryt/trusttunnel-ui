@@ -86,14 +86,14 @@ impl LogPanel {
                 } else {
                     self.content.len()
                 };
-                let line_len = line_text_end - line_start;
+                let line_length = line_text_end - line_start;
 
                 let relative = point(position.x - origin.x, position.y - y);
                 let local_index = match line.closest_index_for_position(relative, line_height) {
                     Ok(index) | Err(index) => index,
                 };
 
-                return line_start + local_index.min(line_len);
+                return line_start + local_index.min(line_length);
             }
 
             y += total_height;
@@ -207,14 +207,14 @@ impl Element for LogPanelElement {
         let shared: Rc<RefCell<Option<LayoutData>>> = Rc::new(RefCell::new(None));
         let panel = self.panel.read(context);
         let content: SharedString = panel.content.clone().into();
-        let content_len = content.len();
+        let content_length = content.len();
 
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
 
         let run = TextRun {
-            len: content_len,
+            len: content_length,
             font: text_style.font(),
             color: text_style.color,
             background_color: None,
@@ -296,24 +296,24 @@ impl Element for LogPanelElement {
         let selected_range = panel.selected_range.clone();
         let line_offsets = &panel.line_offsets;
         let line_height = data.line_height;
-        let num_lines = line_offsets.len();
+        let line_count = line_offsets.len();
 
         let mut selections = Vec::new();
 
         if !selected_range.is_empty() {
             let mut y = bounds.top();
             for (line_index, line) in data.lines.iter().enumerate() {
-                if line_index >= num_lines {
+                if line_index >= line_count {
                     break;
                 }
 
                 let line_start = line_offsets[line_index];
-                let line_text_end = if line_index + 1 < num_lines {
+                let line_text_end = if line_index + 1 < line_count {
                     line_offsets[line_index + 1] - 1
                 } else {
                     panel.content.len()
                 };
-                let line_full_end = if line_index + 1 < num_lines {
+                let line_full_end = if line_index + 1 < line_count {
                     line_offsets[line_index + 1]
                 } else {
                     panel.content.len()

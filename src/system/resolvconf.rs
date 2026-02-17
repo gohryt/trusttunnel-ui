@@ -33,21 +33,21 @@ impl DnsBackend for ResolvconfDns {
     fn set(&mut self, upstreams: &[&str]) -> Result<String, String> {
         log::info!("[dns] setting DNS via resolvconf");
 
-        let servers: Vec<&str> = if upstreams.is_empty() {
+        let dns_servers: Vec<&str> = if upstreams.is_empty() {
             dns::DEFAULT_DNS_SERVERS.to_vec()
         } else {
             upstreams.to_vec()
         };
-        let servers_str = servers.join(", ");
+        let dns_servers_string = dns_servers.join(", ");
 
-        let stdin_content = servers
+        let stdin_content = dns_servers
             .iter()
             .map(|server| format!("nameserver {server}"))
             .collect::<Vec<_>>()
             .join("\n");
 
         if try_resolvconf_set(&stdin_content) {
-            let detail = format!("DNS configured via resolvconf ({servers_str})");
+            let detail = format!("DNS configured via resolvconf ({dns_servers_string})");
             log::info!("[dns] {detail}");
             return Ok(detail);
         }
@@ -55,7 +55,8 @@ impl DnsBackend for ResolvconfDns {
         log::debug!("[resolvconf] direct resolvconf -a failed, retrying with pkexec",);
 
         if try_resolvconf_set_elevated(&stdin_content) {
-            let detail = format!("DNS configured via resolvconf with pkexec ({servers_str})");
+            let detail =
+                format!("DNS configured via resolvconf with pkexec ({dns_servers_string})");
             log::info!("[dns] {detail}");
             return Ok(detail);
         }

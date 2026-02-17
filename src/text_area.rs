@@ -178,9 +178,9 @@ impl TextArea {
         }
         let column = offset - self.line_start(line);
         let prev_line = line - 1;
-        let prev_line_len = self.line_text_end(prev_line) - self.line_start(prev_line);
+        let previous_line_length = self.line_text_end(prev_line) - self.line_start(prev_line);
         self.move_to(
-            self.line_start(prev_line) + column.min(prev_line_len),
+            self.line_start(prev_line) + column.min(previous_line_length),
             context,
         );
     }
@@ -194,9 +194,9 @@ impl TextArea {
         }
         let column = offset - self.line_start(line);
         let next_line = line + 1;
-        let next_line_len = self.line_text_end(next_line) - self.line_start(next_line);
+        let next_line_length = self.line_text_end(next_line) - self.line_start(next_line);
         self.move_to(
-            self.line_start(next_line) + column.min(next_line_len),
+            self.line_start(next_line) + column.min(next_line_length),
             context,
         );
     }
@@ -218,9 +218,9 @@ impl TextArea {
         }
         let column = offset - self.line_start(line);
         let prev_line = line - 1;
-        let prev_line_len = self.line_text_end(prev_line) - self.line_start(prev_line);
+        let previous_line_length = self.line_text_end(prev_line) - self.line_start(prev_line);
         self.select_to(
-            self.line_start(prev_line) + column.min(prev_line_len),
+            self.line_start(prev_line) + column.min(previous_line_length),
             context,
         );
     }
@@ -234,9 +234,9 @@ impl TextArea {
         }
         let column = offset - self.line_start(line);
         let next_line = line + 1;
-        let next_line_len = self.line_text_end(next_line) - self.line_start(next_line);
+        let next_line_length = self.line_text_end(next_line) - self.line_start(next_line);
         self.select_to(
-            self.line_start(next_line) + column.min(next_line_len),
+            self.line_start(next_line) + column.min(next_line_length),
             context,
         );
     }
@@ -344,10 +344,10 @@ impl TextArea {
         };
 
         let line_start = self.line_start(line_index);
-        let line_text_len = self.line_text_end(line_index) - line_start;
+        let line_text_length = self.line_text_end(line_index) - line_start;
         let relative_x = position.x - bounds.left();
         let display_index = self.last_layouts[line_index].closest_index_for_x(relative_x);
-        line_start + display_index.min(line_text_len)
+        line_start + display_index.min(line_text_length)
     }
 
     fn on_mouse_down(
@@ -585,10 +585,10 @@ impl Element for TextAreaElement {
         context: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let area = self.area.read(context);
-        let num_lines = area.num_lines().max(1);
+        let line_count = area.num_lines().max(1);
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = (window.line_height() * num_lines as f32).into();
+        style.size.height = (window.line_height() * line_count as f32).into();
         (window.request_layout(style, [], context), ())
     }
 
@@ -639,11 +639,11 @@ impl Element for TextAreaElement {
             };
         }
 
-        let num_lines = area.num_lines();
-        let mut shaped_lines = Vec::with_capacity(num_lines);
+        let line_count = area.num_lines();
+        let mut shaped_lines = Vec::with_capacity(line_count);
         let mut selections = Vec::new();
 
-        for line_index in 0..num_lines {
+        for line_index in 0..line_count {
             let line_start = area.line_start(line_index);
             let line_text_end = area.line_text_end(line_index);
             let line_full_end = area.line_full_end(line_index);

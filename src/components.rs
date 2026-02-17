@@ -274,16 +274,77 @@ pub fn status_detail(text: String) -> Div {
         .child(text)
 }
 
-pub fn titlebar_title(text: &str) -> Div {
+pub fn titlebar_tab(
+    id: impl Into<ElementId>,
+    text: &str,
+    active: bool,
+    disabled: bool,
+) -> Stateful<Div> {
     div()
+        .id(id)
         .flex()
-        .flex_1()
-        .h_full()
         .items_center()
-        .pl(px(PADDING_COLUMN + PADDING_INPUT_HORIZONTAL))
+        .px(px(PADDING_COLUMN + PADDING_INPUT_HORIZONTAL))
+        .h(px(TITLEBAR_HEIGHT))
         .text_size(px(TEXT_SIZE_SMALL))
-        .text_color(rgb(TEXT_DIM))
+        .when(active, |element| element.text_color(rgb(TEXT_PRIMARY)))
+        .when(!active && !disabled, |element| {
+            element
+                .text_color(rgb(TEXT_DIM))
+                .cursor_pointer()
+                .hover(|style| style.text_color(rgb(TEXT_PRIMARY)).bg(rgb(BORDER)))
+        })
+        .when(disabled, |element| {
+            element
+                .text_color(rgb(TEXT_DIM))
+                .cursor_default()
+                .opacity(0.5)
+        })
         .child(text.to_string())
+}
+
+pub fn version_item(tag: &str, active: bool, disabled: bool, focus_handle: &FocusHandle) -> Div {
+    let (background, text_color, border) = match (active, disabled) {
+        (true, true) => (BORDER, TEXT_DIM, BORDER),
+        (true, false) => (BUTTON_PRIMARY, TEXT_WHITE, BORDER_FOCUS),
+        (false, _) => (
+            INPUT_BACKGROUND,
+            if disabled { TEXT_DIM } else { TEXT_PRIMARY },
+            BORDER,
+        ),
+    };
+
+    div()
+        .track_focus(focus_handle)
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .h(px(ELEMENT_HEIGHT))
+        .w_full()
+        .px(px(PADDING_INPUT_HORIZONTAL))
+        .rounded(px(RADIUS))
+        .border_1()
+        .border_color(rgb(border))
+        .bg(rgb(background))
+        .text_color(rgb(text_color))
+        .text_size(px(TEXT_SIZE_SMALL))
+        .when(disabled, |element| element.cursor_default())
+        .when(!disabled, |element| {
+            element
+                .cursor_pointer()
+                .when(active, |element| {
+                    element
+                        .hover(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
+                        .focus(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
+                })
+                .when(!active, |element| {
+                    element
+                        .hover(|style| style.border_color(rgb(BORDER_FOCUS)))
+                        .focus(|style| style.border_color(rgb(BORDER_FOCUS)))
+                })
+        })
+        .overflow_hidden()
+        .child(tag.to_string())
 }
 
 pub fn titlebar_button(id: impl Into<ElementId>, text: &str, danger: bool) -> Stateful<Div> {

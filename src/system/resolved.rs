@@ -50,7 +50,7 @@ impl DnsBackend for ResolvedDns {
         dns_args.extend(servers_slice);
 
         if !resolvectl(&dns_args) {
-            let detail = format!("Failed to set DNS servers on {interface} via resolvectl");
+            let detail = format!("Failed to set DNS server entries on {interface} via resolvectl");
             log::warn!("[dns] {detail}");
             return Err(detail);
         }
@@ -75,8 +75,9 @@ impl DnsBackend for ResolvedDns {
 
         self.interface = Some(interface.clone());
 
-        let servers_str = servers_slice.join(", ");
-        let detail = format!("DNS configured via systemd-resolved on {interface} ({servers_str})");
+        let servers_string = servers_slice.join(", ");
+        let detail =
+            format!("DNS configured via systemd-resolved on {interface} ({servers_string})");
         log::info!("[dns] {detail}");
         Ok(detail)
     }
@@ -124,12 +125,12 @@ fn find_tun_interface() -> Option<String> {
 
     if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
+            let interface_name = entry.file_name();
+            let interface_name_string = interface_name.to_string_lossy();
             let tun_flags_path = entry.path().join("tun_flags");
             if tun_flags_path.exists() {
-                log::debug!("[resolved] found TUN interface via sysfs: {name_str}");
-                return Some(name_str.into_owned());
+                log::debug!("[resolved] found TUN interface via sysfs: {interface_name_string}");
+                return Some(interface_name_string.into_owned());
             }
         }
     }
@@ -146,17 +147,17 @@ fn find_tun_interface() -> Option<String> {
     None
 }
 
-fn resolvectl(args: &[&str]) -> bool {
-    if run_silent("resolvectl", args) {
+fn resolvectl(arguments: &[&str]) -> bool {
+    if run_silent("resolvectl", arguments) {
         return true;
     }
 
     log::debug!(
         "[resolved] resolvectl {} failed, retrying with pkexec",
-        args.first().unwrap_or(&""),
+        arguments.first().unwrap_or(&""),
     );
 
-    let mut pkexec_args = vec!["resolvectl"];
-    pkexec_args.extend_from_slice(args);
-    run_silent("pkexec", &pkexec_args)
+    let mut pkexec_arguments = vec!["resolvectl"];
+    pkexec_arguments.extend_from_slice(arguments);
+    run_silent("pkexec", &pkexec_arguments)
 }

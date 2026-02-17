@@ -7,19 +7,22 @@ edition = "2024"
 default = ["wayland", "x11"]
 wayland = ["gpui/wayland"]
 x11 = ["gpui/x11"]
+windows = ["gpui/windows-manifest"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+serde_json = "1"
+futures = "0.3"
 unicode-segmentation = "1.11"
 log = "0.4"
 env_logger = "0.11"
 chrono = "0.4"
 dirs = "6"
 gpui = { git = "https://github.com/gohryt/zed", rev = "48b2e0533c35203a7f4a2b0f4a993dd42c41427c", default-features = false }
+reqwest_client = { git = "https://github.com/gohryt/zed", rev = "48b2e0533c35203a7f4a2b0f4a993dd42c41427c" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-gpui = { git = "https://github.com/gohryt/zed", rev = "48b2e0533c35203a7f4a2b0f4a993dd42c41427c", default-features = false, features = ["windows-manifest"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinInet",

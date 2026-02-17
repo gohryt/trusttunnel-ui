@@ -221,11 +221,11 @@ impl TextInput {
 
     fn display_offset_to_content(&self, display_offset: usize) -> usize {
         if self.is_password {
-            let bullet_len = '•'.len_utf8();
-            let grapheme_idx = display_offset / bullet_len;
+            let bullet_length = '•'.len_utf8();
+            let grapheme_index = display_offset / bullet_length;
             self.content
                 .grapheme_indices(true)
-                .nth(grapheme_idx)
+                .nth(grapheme_index)
                 .map(|(i, _)| i)
                 .unwrap_or(self.content.len())
         } else {
@@ -247,8 +247,8 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        let display_idx = line.closest_index_for_x(position.x - bounds.left());
-        self.display_offset_to_content(display_idx)
+        let display_index = line.closest_index_for_x(position.x - bounds.left());
+        self.display_offset_to_content(display_index)
     }
 
     fn select_to(&mut self, offset: usize, context: &mut Context<Self>) {
@@ -557,10 +557,10 @@ impl Element for TextElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
 
-        let bullet_len = '•'.len_utf8();
+        let bullet_length = '•'.len_utf8();
         let to_display = |offset: usize| -> usize {
             if is_password {
-                content[..offset].graphemes(true).count() * bullet_len
+                content[..offset].graphemes(true).count() * bullet_length
             } else {
                 offset
             }

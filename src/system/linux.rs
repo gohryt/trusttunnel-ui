@@ -1,23 +1,24 @@
 use std::{
     io,
+    path::Path,
     process::{Command, Stdio},
 };
 
 use super::{ChildProcess, run_silent, run_silent_with_output};
 
 pub fn terminate_process(process_id: u32) -> bool {
-    let id_string = process_id.to_string();
-    run_silent("kill", &["-INT", &id_string])
+    let process_id_string = process_id.to_string();
+    run_silent("kill", &["-INT", &process_id_string])
 }
 
 pub fn elevate_terminate_process(process_id: u32) -> bool {
-    let id_string = process_id.to_string();
-    run_silent("pkexec", &["kill", "-INT", &id_string])
+    let process_id_string = process_id.to_string();
+    run_silent("pkexec", &["kill", "-INT", &process_id_string])
 }
 
 pub fn spawn_client(
     binary: &str,
-    configuration_path: &std::path::Path,
+    configuration_path: &Path,
     needs_elevation: bool,
 ) -> io::Result<ChildProcess> {
     if needs_elevation {
@@ -68,7 +69,7 @@ pub fn find_client_binary() -> (String, bool) {
             log::info!("[binary] found via which: {candidate} → {path}");
             return (path, true);
         }
-        if std::path::Path::new(candidate).exists() {
+        if Path::new(candidate).exists() {
             log::info!("[binary] found on disk: {candidate}");
             return (candidate.to_string(), true);
         }
@@ -79,7 +80,8 @@ pub fn find_client_binary() -> (String, bool) {
 }
 
 pub fn check_tun_device() -> bool {
-    let path = std::path::Path::new("/dev/net/tun");
+    let path = Path::new("/dev/net/tun");
+
     if path.exists() {
         log::debug!("[preflight] /dev/net/tun exists");
         true
@@ -91,10 +93,12 @@ pub fn check_tun_device() -> bool {
 
 pub fn check_elevation_available() -> bool {
     let (success, _) = run_silent_with_output("which", &["pkexec"]);
+
     if success {
         log::debug!("[preflight] pkexec is available");
     } else {
         log::warn!("[preflight] pkexec not found — TUN mode will not work without root privileges");
     }
+
     success
 }

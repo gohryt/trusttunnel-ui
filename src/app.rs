@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "windows")]
+use std::io::Read;
+
 use gpui::{
     App, AsyncApp, Bounds, Context, CursorStyle, Decorations, Entity, FocusHandle, Focusable,
     HitboxBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
@@ -15,6 +18,7 @@ use gpui::{
 
 use crate::{
     app_state::AppState,
+    client_manager::{self, ClientManagerState, ClientRelease},
     components::*,
     configuration::*,
     connection_state::ConnectionState,
@@ -26,8 +30,10 @@ use crate::{
     theme::*,
 };
 
-use system::dns::{self, DnsBackend};
-use system::proxy::{self as proxy, ProxyBackend};
+use system::{
+    dns::{self, DnsBackend},
+    proxy::{self as proxy, ProxyBackend},
+};
 
 actions!(
     trusttunnel,
@@ -43,6 +49,12 @@ actions!(
         RemoveCredential
     ]
 );
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ActiveTab {
+    Connection,
+    Client,
+}
 
 pub struct CredentialDragState {
     pub index: usize,
@@ -73,6 +85,7 @@ pub struct AppInitialization {
     pub stored_credentials: Vec<StoredCredential>,
     pub selected_credential: Option<usize>,
     pub tunnel_mode: TunnelMode,
+    pub client_manager_state: Arc<Mutex<ClientManagerState>>,
 }
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -137,6 +150,12 @@ pub struct TrustTunnelApp {
     stored_credentials: Vec<StoredCredential>,
     selected_credential: Option<usize>,
     credential_drag: Option<CredentialDragState>,
+    active_tab: ActiveTab,
+    client_manager_state: Arc<Mutex<ClientManagerState>>,
+    client_version_focus_handles: Vec<FocusHandle>,
+    client_download_focus_handle: FocusHandle,
+    client_remove_focus_handle: FocusHandle,
+    client_scroll_handle: ScrollHandle,
 }
 
 impl TrustTunnelApp {
@@ -150,6 +169,21 @@ impl TrustTunnelApp {
         }
 
         let credential_count = stored_credentials.len();
+
+        let has_selected_client = initialization
+            .client_manager_state
+            .lock()
+            .unwrap()
+            .has_selected_client();
+        let initial_tab = if has_selected_client {
+            ActiveTab::Connection
+        } else {
+            ActiveTab::Client
+        };
+
+        if initial_tab == ActiveTab::Client {
+            client_manager::start_fetch_releases(initialization.client_manager_state.clone());
+        }
 
         let configuration_scroll_handle = ScrollHandle::new();
         let configuration_scroll_anchors =
@@ -213,6 +247,12 @@ impl TrustTunnelApp {
             stored_credentials,
             selected_credential,
             credential_drag: None,
+            active_tab: initial_tab,
+            client_manager_state: initialization.client_manager_state,
+            client_version_focus_handles: Vec::new(),
+            client_download_focus_handle: context.focus_handle(),
+            client_remove_focus_handle: context.focus_handle(),
+            client_scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -296,14 +336,16 @@ impl TrustTunnelApp {
             return;
         }
         let Some(process_id) = child.id() else {
-            log::warn!("[terminate] no PID available, forcing kill");
+            log::warn!("[terminate] no process_id available, forcing kill");
             child.kill();
             return;
         };
         if system_services.terminate_process(process_id) {
-            log::info!("[terminate] sent terminate signal to pid={process_id}");
+            log::info!("[terminate] sent terminate signal to process_id={process_id}");
         } else {
-            log::info!("[terminate] terminate failed for pid={process_id}, trying elevation");
+            log::info!(
+                "[terminate] terminate failed for process_id={process_id}, trying elevation"
+            );
             std::thread::spawn(move || {
                 system_services.elevate_terminate_process(process_id);
             });
@@ -324,16 +366,18 @@ impl TrustTunnelApp {
             }
 
             let Some(process_id) = child.id() else {
-                log::warn!("[terminate] no PID available, forcing kill");
+                log::warn!("[terminate] no process_id available, forcing kill");
                 child.kill();
                 child.wait();
                 return;
             };
 
             if system_services.terminate_process(process_id) {
-                log::info!("[terminate] sent terminate signal to pid={process_id}");
+                log::info!("[terminate] sent terminate signal to process_id={process_id}");
             } else {
-                log::info!("[terminate] terminate failed for pid={process_id}, trying elevation");
+                log::info!(
+                    "[terminate] terminate failed for process_id={process_id}, trying elevation"
+                );
                 system_services.elevate_terminate_process(process_id);
             }
 
@@ -348,7 +392,7 @@ impl TrustTunnelApp {
                 std::thread::sleep(poll_interval);
             }
 
-            log::warn!("[terminate] graceful shutdown timed out for pid={process_id}");
+            log::warn!("[terminate] graceful shutdown timed out for process_id={process_id}");
             child.kill();
             let exit = child.wait();
             log::info!("[terminate] child reaped: {exit}");
@@ -357,12 +401,12 @@ impl TrustTunnelApp {
 
     #[cfg(target_os = "windows")]
     fn kill_child_sync(&self, mut child: ChildProcess) {
-        let pid_label = child
+        let process_id_label = child
             .id()
-            .map(|pid| pid.to_string())
+            .map(|process_id| process_id.to_string())
             .unwrap_or_else(|| "elevated".into());
         log::info!(
-            "[terminate] synchronously killing child (pid={pid_label}, elevated={})",
+            "[terminate] synchronously killing child (process_id={process_id_label}, elevated={})",
             child.is_elevated(),
         );
         child.kill();
@@ -373,7 +417,9 @@ impl TrustTunnelApp {
                 break;
             }
             if Instant::now() >= deadline {
-                log::warn!("[terminate] synchronous wait timed out for pid={pid_label}");
+                log::warn!(
+                    "[terminate] synchronous wait timed out for process_id={process_id_label}"
+                );
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -392,8 +438,6 @@ impl TrustTunnelApp {
             let log_path = path.to_path_buf();
             let exit_marker = exit_marker_base.to_path_buf();
             std::thread::spawn(move || {
-                use std::io::Read;
-
                 let mut attempts = 0u32;
                 let file = loop {
                     match fs::File::open(&log_path) {
@@ -575,10 +619,10 @@ impl TrustTunnelApp {
 
     fn handle_child_exit(&mut self, exit: ChildExit, context: &mut Context<Self>) {
         #[cfg(target_os = "windows")]
-        if let Some(ref child) = self.child_process {
-            if child.is_elevated() {
-                cleanup_elevated_files();
-            }
+        if let Some(ref child) = self.child_process
+            && child.is_elevated()
+        {
+            cleanup_elevated_files();
         }
         self.child_process = None;
         if !self.proxy_overrides.is_empty() {
@@ -667,9 +711,6 @@ impl TrustTunnelApp {
             self.proxy_overrides = backends;
         }
 
-        // On Windows TUN mode the client binary itself manages DNS via the
-        // `change_system_dns` configuration flag, so the UI must not apply a
-        // second, redundant DNS override that would conflict on cleanup.
         let ui_manages_dns = self.dns_enabled
             && self.tunnel_mode.is_tun()
             && self.dns_override.is_none()
@@ -1041,7 +1082,149 @@ impl TrustTunnelApp {
             self.selected_credential
                 .and_then(|index| self.stored_credentials.get(index)),
         );
+        if let Ok(client_manager_state_guard) = self.client_manager_state.lock() {
+            state.set_selected_client_version(
+                client_manager_state_guard.selected_version.as_deref(),
+            );
+        }
         state.save();
+    }
+
+    fn switch_tab(&mut self, tab: ActiveTab, context: &mut Context<Self>) {
+        if tab == ActiveTab::Connection {
+            let has_client = self
+                .client_manager_state
+                .lock()
+                .map(|client_manager_state_guard| client_manager_state_guard.has_selected_client())
+                .unwrap_or(false);
+            if !has_client {
+                return;
+            }
+        }
+        if tab == ActiveTab::Client {
+            client_manager::start_fetch_releases(self.client_manager_state.clone());
+        }
+        self.active_tab = tab;
+        context.notify();
+    }
+
+    fn select_client_version(&mut self, version: String, context: &mut Context<Self>) {
+        {
+            let mut client_manager_state_guard = self.client_manager_state.lock().unwrap();
+            client_manager_state_guard.selected_version = Some(version.clone());
+        }
+        self.update_binary_from_client_manager();
+        self.save_app_state();
+        context.notify();
+    }
+
+    fn download_client_version(&mut self, release: ClientRelease, context: &mut Context<Self>) {
+        client_manager::start_download(self.client_manager_state.clone(), release);
+        context.notify();
+    }
+
+    fn download_selected_client_version(&mut self, context: &mut Context<Self>) {
+        let release = {
+            let client_manager_state_guard = self.client_manager_state.lock().unwrap();
+            let Some(version) = client_manager_state_guard.selected_version.as_ref() else {
+                return;
+            };
+            if client_manager_state_guard.installed.contains(version)
+                || client_manager_state_guard.is_downloading(version)
+            {
+                return;
+            }
+            client_manager_state_guard
+                .releases
+                .iter()
+                .find(|r| r.tag == *version)
+                .cloned()
+        };
+        if let Some(release) = release {
+            self.download_client_version(release, context);
+        }
+    }
+
+    fn remove_selected_client_version(&mut self, context: &mut Context<Self>) {
+        if self.is_locked() {
+            return;
+        }
+        let version = {
+            let client_manager_state_guard = self.client_manager_state.lock().unwrap();
+            let Some(version) = client_manager_state_guard.selected_version.clone() else {
+                return;
+            };
+            if !client_manager_state_guard.installed.contains(&version) {
+                return;
+            }
+            version
+        };
+        self.remove_client_version(version, context);
+    }
+
+    fn remove_client_version(&mut self, version: String, context: &mut Context<Self>) {
+        {
+            let mut client_manager_state_guard = self.client_manager_state.lock().unwrap();
+            if client_manager_state_guard.selected_version.as_deref() == Some(&version) {
+                client_manager_state_guard.selected_version = None;
+            }
+        }
+        if let Err(error) = client_manager::remove_client(&version) {
+            log::error!("[client_manager] failed to remove {version}: {error}");
+        }
+        {
+            let mut client_manager_state_guard = self.client_manager_state.lock().unwrap();
+            client_manager_state_guard.installed = client_manager::scan_installed_clients();
+        }
+        self.update_binary_from_client_manager();
+        self.save_app_state();
+        context.notify();
+    }
+
+    fn update_binary_from_client_manager(&mut self) {
+        let client_manager_state_guard = self.client_manager_state.lock().unwrap();
+        if let Some(managed_path) = client_manager_state_guard.selected_binary_path() {
+            let path_string = managed_path.to_string_lossy().to_string();
+            let exists = managed_path.exists();
+            self.binary_path = path_string;
+            self.binary_found = exists;
+        } else {
+            let (path, found) = self.system_services.find_client_binary();
+            self.binary_path = path;
+            self.binary_found = found;
+        }
+    }
+
+    fn sync_client_version_focus_handles(&mut self, count: usize, context: &mut Context<Self>) {
+        while self.client_version_focus_handles.len() < count {
+            self.client_version_focus_handles
+                .push(context.focus_handle());
+        }
+        self.client_version_focus_handles.truncate(count);
+    }
+
+    fn activate_client_version_button(&mut self, index: usize, context: &mut Context<Self>) {
+        let tag = {
+            let client_manager_state_guard = self.client_manager_state.lock().unwrap();
+
+            let mut tags: Vec<String> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for release in &client_manager_state_guard.releases {
+                seen.insert(release.tag.clone());
+                tags.push(release.tag.clone());
+            }
+            for version in &client_manager_state_guard.installed {
+                if !seen.contains(version) {
+                    tags.push(version.clone());
+                }
+            }
+
+            tags.get(index).cloned()
+        };
+
+        if let Some(tag) = tag {
+            self.select_client_version(tag, context);
+        }
     }
 
     fn build_credential_from_fields(&self, context: &App) -> CredentialFile {
@@ -1309,12 +1492,12 @@ impl TrustTunnelApp {
 
         match spawn_result {
             Ok(mut child) => {
-                let pid_label = child
+                let process_id_label = child
                     .id()
-                    .map(|pid| pid.to_string())
+                    .map(|process_id| process_id.to_string())
                     .unwrap_or_else(|| "elevated".into());
                 log::info!(
-                    "[connect] child started (pid={pid_label}, mode={}, elevated={})",
+                    "[connect] child started (process_id={process_id_label}, mode={}, elevated={})",
                     mode.label(),
                     child.is_elevated(),
                 );
@@ -1390,6 +1573,21 @@ impl TrustTunnelApp {
     }
 
     fn activate(&mut self, _: &Activate, window: &mut Window, context: &mut Context<Self>) {
+        if self.active_tab == ActiveTab::Client {
+            if let Some(index) = self
+                .client_version_focus_handles
+                .iter()
+                .position(|handle| handle.is_focused(window))
+            {
+                self.activate_client_version_button(index, context);
+            } else if self.client_download_focus_handle.is_focused(window) {
+                self.download_selected_client_version(context);
+            } else if self.client_remove_focus_handle.is_focused(window) {
+                self.remove_selected_client_version(context);
+            }
+            return;
+        }
+
         if let Some(index) = self
             .credential_focus_handles
             .iter()
@@ -1453,6 +1651,43 @@ impl TrustTunnelApp {
     }
 
     fn focusable_entries(&self, context: &App) -> Vec<(FocusHandle, Option<ScrollAnchor>)> {
+        if self.active_tab == ActiveTab::Client {
+            let mut entries: Vec<(FocusHandle, Option<ScrollAnchor>)> = self
+                .client_version_focus_handles
+                .iter()
+                .map(|handle| (handle.clone(), None))
+                .collect();
+            let locked = self.is_locked();
+            if let Ok(client_manager_state_guard) = self.client_manager_state.lock() {
+                let selected = client_manager_state_guard.selected_version.as_deref();
+                let selected_is_installed = selected.is_some_and(|v| {
+                    client_manager_state_guard
+                        .installed
+                        .contains(&v.to_string())
+                });
+                let selected_is_downloading =
+                    selected.is_some_and(|v| client_manager_state_guard.downloads.contains_key(v));
+                let has_release = selected.is_some_and(|v| {
+                    client_manager_state_guard
+                        .releases
+                        .iter()
+                        .any(|r| r.tag == v)
+                });
+                let can_download = selected.is_some()
+                    && !selected_is_installed
+                    && has_release
+                    && !selected_is_downloading;
+                let can_remove = selected.is_some() && selected_is_installed && !locked;
+                if can_download {
+                    entries.push((self.client_download_focus_handle.clone(), None));
+                }
+                if can_remove {
+                    entries.push((self.client_remove_focus_handle.clone(), None));
+                }
+            }
+            return entries;
+        }
+
         let anchors = &self.configuration_scroll_anchors;
         let mut entries: Vec<(FocusHandle, Option<ScrollAnchor>)> = self
             .credential_focus_handles
@@ -1599,8 +1834,6 @@ impl Drop for TrustTunnelApp {
     fn drop(&mut self) {
         log::info!("[drop] TrustTunnelApp shutting down");
         self.save_app_state();
-        // cleanup_child() already restores system proxy and DNS override,
-        // so no need to duplicate that logic here.
         if let Some(child) = self.cleanup_child() {
             #[cfg(target_os = "windows")]
             if child.is_elevated() {
@@ -1654,6 +1887,10 @@ impl Render for TrustTunnelApp {
     fn render(&mut self, window: &mut Window, context: &mut Context<Self>) -> impl IntoElement {
         if self.connection_state.is_active() {
             self.poll_process_state(context);
+        }
+
+        if self.active_tab == ActiveTab::Client {
+            context.notify();
         }
 
         let state_label_text = self.connection_state.label();
@@ -1726,171 +1963,189 @@ impl Render for TrustTunnelApp {
             .size_full()
             .bg(rgb(SURFACE))
             .child(self.render_titlebar(show_controls, context))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id("configuration-scroll")
-                            .flex()
-                            .flex_col()
-                            .w(px(LEFT_COLUMN_WIDTH))
-                            .flex_shrink_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.configuration_scroll_handle)
-                            .border_r_1()
-                            .border_color(rgb(BORDER))
-                            .px(px(PADDING_COLUMN))
-                            .pb(px(PADDING_COLUMN))
-                            .pt(px(PADDING_COLUMN_TOP))
-                            .gap(px(GAP_MEDIUM))
-                            .child(
-                                div()
-                                    .id("anchor-credentials")
-                                    .anchor_scroll(Some(
-                                        self.configuration_scroll_anchors[9].clone(),
-                                    ))
-                                    .child(self.render_credential_list(locked, context)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(GAP_SMALL))
-                                    .child(
-                                        div()
-                                            .id("anchor-hostname")
-                                            .anchor_scroll(Some(
-                                                self.configuration_scroll_anchors[0].clone(),
-                                            ))
-                                            .child(field("Hostname", self.hostname_input.clone())),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("anchor-addresses")
-                                            .anchor_scroll(Some(
-                                                self.configuration_scroll_anchors[1].clone(),
-                                            ))
-                                            .child(field(
-                                                "Addresses (comma-separated)",
-                                                self.addresses_input.clone(),
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("anchor-username")
-                                            .anchor_scroll(Some(
-                                                self.configuration_scroll_anchors[2].clone(),
-                                            ))
-                                            .child(field("Username", self.username_input.clone())),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("anchor-password")
-                                            .anchor_scroll(Some(
-                                                self.configuration_scroll_anchors[3].clone(),
-                                            ))
-                                            .child(field("Password", self.password_input.clone())),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("anchor-certificate")
-                                    .anchor_scroll(Some(
-                                        self.configuration_scroll_anchors[4].clone(),
-                                    ))
-                                    .child(field(
-                                        "Certificate (PEM)",
-                                        self.certificate_input.clone(),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("anchor-dns-upstreams")
-                                    .anchor_scroll(Some(
-                                        self.configuration_scroll_anchors[5].clone(),
-                                    ))
-                                    .child(field(
-                                        "DNS Upstreams (comma-separated)",
-                                        self.dns_upstreams_input.clone(),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("anchor-endpoint-toggles")
-                                    .anchor_scroll(Some(
-                                        self.configuration_scroll_anchors[6].clone(),
-                                    ))
-                                    .child(self.render_endpoint_toggles(locked, context)),
-                            )
-                            .child(
-                                div()
-                                    .id("anchor-upstream")
-                                    .anchor_scroll(Some(
-                                        self.configuration_scroll_anchors[7].clone(),
-                                    ))
-                                    .child(
-                                        self.render_upstream_selector(&upstream, locked, context),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("anchor-fallback")
-                                    .anchor_scroll(Some(
-                                        self.configuration_scroll_anchors[8].clone(),
-                                    ))
-                                    .child(
-                                        self.render_fallback_selector(&fallback, locked, context),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .overflow_hidden()
-                            .px(px(PADDING_COLUMN))
-                            .pb(px(PADDING_COLUMN))
-                            .pt(px(PADDING_COLUMN_TOP))
-                            .gap(px(GAP_MEDIUM))
-                            .child(self.render_mode_selector(tunnel_mode, locked, context))
-                            .child(self.render_connection_toggles(locked, context))
-                            .child(
-                                button_action(
-                                    button_label,
-                                    button_background,
-                                    button_hover_background,
-                                    busy,
-                                    &self.connect_button_focus_handle,
+            .child({
+                if self.active_tab == ActiveTab::Client {
+                    self.render_client_tab(context).into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_1()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("configuration-scroll")
+                                .flex()
+                                .flex_col()
+                                .w(px(LEFT_COLUMN_WIDTH))
+                                .flex_shrink_0()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.configuration_scroll_handle)
+                                .border_r_1()
+                                .border_color(rgb(BORDER))
+                                .px(px(PADDING_COLUMN))
+                                .pb(px(PADDING_COLUMN))
+                                .pt(px(PADDING_COLUMN_TOP))
+                                .gap(px(GAP_MEDIUM))
+                                .child(
+                                    div()
+                                        .id("anchor-credentials")
+                                        .anchor_scroll(Some(
+                                            self.configuration_scroll_anchors[9].clone(),
+                                        ))
+                                        .child(self.render_credential_list(locked, context)),
                                 )
-                                .when(!busy, |element| {
-                                    element.on_mouse_up(
-                                        MouseButton::Left,
-                                        context.listener(Self::on_connect_click),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(GAP_SMALL))
+                                        .child(
+                                            div()
+                                                .id("anchor-hostname")
+                                                .anchor_scroll(Some(
+                                                    self.configuration_scroll_anchors[0].clone(),
+                                                ))
+                                                .child(field(
+                                                    "Hostname",
+                                                    self.hostname_input.clone(),
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("anchor-addresses")
+                                                .anchor_scroll(Some(
+                                                    self.configuration_scroll_anchors[1].clone(),
+                                                ))
+                                                .child(field(
+                                                    "Addresses (comma-separated)",
+                                                    self.addresses_input.clone(),
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("anchor-username")
+                                                .anchor_scroll(Some(
+                                                    self.configuration_scroll_anchors[2].clone(),
+                                                ))
+                                                .child(field(
+                                                    "Username",
+                                                    self.username_input.clone(),
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("anchor-password")
+                                                .anchor_scroll(Some(
+                                                    self.configuration_scroll_anchors[3].clone(),
+                                                ))
+                                                .child(field(
+                                                    "Password",
+                                                    self.password_input.clone(),
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("anchor-certificate")
+                                        .anchor_scroll(Some(
+                                            self.configuration_scroll_anchors[4].clone(),
+                                        ))
+                                        .child(field(
+                                            "Certificate (PEM)",
+                                            self.certificate_input.clone(),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("anchor-dns-upstreams")
+                                        .anchor_scroll(Some(
+                                            self.configuration_scroll_anchors[5].clone(),
+                                        ))
+                                        .child(field(
+                                            "DNS Upstreams (comma-separated)",
+                                            self.dns_upstreams_input.clone(),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("anchor-endpoint-toggles")
+                                        .anchor_scroll(Some(
+                                            self.configuration_scroll_anchors[6].clone(),
+                                        ))
+                                        .child(self.render_endpoint_toggles(locked, context)),
+                                )
+                                .child(
+                                    div()
+                                        .id("anchor-upstream")
+                                        .anchor_scroll(Some(
+                                            self.configuration_scroll_anchors[7].clone(),
+                                        ))
+                                        .child(
+                                            self.render_upstream_selector(
+                                                &upstream, locked, context,
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("anchor-fallback")
+                                        .anchor_scroll(Some(
+                                            self.configuration_scroll_anchors[8].clone(),
+                                        ))
+                                        .child(
+                                            self.render_fallback_selector(
+                                                &fallback, locked, context,
+                                            ),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .overflow_hidden()
+                                .px(px(PADDING_COLUMN))
+                                .pb(px(PADDING_COLUMN))
+                                .pt(px(PADDING_COLUMN_TOP))
+                                .gap(px(GAP_MEDIUM))
+                                .child(self.render_mode_selector(tunnel_mode, locked, context))
+                                .child(self.render_connection_toggles(locked, context))
+                                .child(
+                                    button_action(
+                                        button_label,
+                                        button_background,
+                                        button_hover_background,
+                                        busy,
+                                        &self.connect_button_focus_handle,
                                     )
-                                }),
-                            )
-                            .child(self.render_status(state_label_text, state_color, detail))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .gap(px(GAP_EXTRA_SMALL))
-                                    .child(label("Logs"))
-                                    .child(
-                                        log_container()
-                                            .track_scroll(&self.log_scroll_handle)
-                                            .child(self.log_panel.clone()),
-                                    ),
-                            ),
-                    ),
-            );
+                                    .when(!busy, |element| {
+                                        element.on_mouse_up(
+                                            MouseButton::Left,
+                                            context.listener(Self::on_connect_click),
+                                        )
+                                    }),
+                                )
+                                .child(self.render_status(state_label_text, state_color, detail))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .gap(px(GAP_EXTRA_SMALL))
+                                        .child(label("Logs"))
+                                        .child(
+                                            log_container()
+                                                .track_scroll(&self.log_scroll_handle)
+                                                .child(self.log_panel.clone()),
+                                        ),
+                                ),
+                        )
+                        .into_any_element()
+                }
+            });
 
         div()
             .id("window-backdrop")
@@ -1961,6 +2216,21 @@ impl TrustTunnelApp {
         show_controls: bool,
         context: &mut Context<Self>,
     ) -> impl IntoElement {
+        let has_client = self
+            .client_manager_state
+            .lock()
+            .map(|client_manager_state_guard| client_manager_state_guard.has_selected_client())
+            .unwrap_or(false);
+
+        let client_button_label = self
+            .client_manager_state
+            .lock()
+            .ok()
+            .and_then(|client_manager_state_guard| {
+                client_manager_state_guard.selected_version.clone()
+            })
+            .unwrap_or_else(|| "Client".to_string());
+
         div()
             .flex()
             .flex_row()
@@ -1969,7 +2239,38 @@ impl TrustTunnelApp {
             .h(px(TITLEBAR_HEIGHT))
             .bg(rgb(TITLEBAR_BACKGROUND))
             .child(
-                titlebar_title("TrustTunnel")
+                titlebar_tab(
+                    "tab-connection",
+                    "TrustTunnel",
+                    self.active_tab == ActiveTab::Connection,
+                    !has_client,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    context.listener(|this, _, _, context| {
+                        this.switch_tab(ActiveTab::Connection, context);
+                    }),
+                ),
+            )
+            .child(
+                titlebar_tab(
+                    "tab-client",
+                    &client_button_label,
+                    self.active_tab == ActiveTab::Client,
+                    false,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    context.listener(|this, _, _, context| {
+                        this.switch_tab(ActiveTab::Client, context);
+                    }),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .h_full()
                     .window_control_area(WindowControlArea::Drag)
                     .cursor(CursorStyle::default())
                     .on_mouse_down(
@@ -2361,6 +2662,171 @@ impl TrustTunnelApp {
                     ),
                 ),
         )
+    }
+
+    fn render_client_tab(&mut self, context: &mut Context<Self>) -> impl IntoElement {
+        self.update_binary_from_client_manager();
+
+        let (releases, installed, selected_version, downloads, is_fetching) = {
+            let client_manager_state_guard = self.client_manager_state.lock().unwrap();
+            (
+                client_manager_state_guard.releases.clone(),
+                client_manager_state_guard.installed.clone(),
+                client_manager_state_guard.selected_version.clone(),
+                client_manager_state_guard.downloads.clone(),
+                client_manager_state_guard.fetching_releases,
+            )
+        };
+
+        let mut version_entries: Vec<(String, bool, Option<ClientRelease>)> = Vec::new();
+        let mut seen_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for release in &releases {
+            seen_tags.insert(release.tag.clone());
+            version_entries.push((
+                release.tag.clone(),
+                installed.contains(&release.tag),
+                Some(release.clone()),
+            ));
+        }
+
+        for version in &installed {
+            if !seen_tags.contains(version) {
+                version_entries.push((version.clone(), true, None));
+            }
+        }
+
+        self.sync_client_version_focus_handles(version_entries.len(), context);
+
+        let locked = self.is_locked();
+        let selected = selected_version.as_deref();
+        let selected_is_installed = selected
+            .map(|v| installed.contains(&v.to_string()))
+            .unwrap_or(false);
+        let selected_is_downloading = selected.map(|v| downloads.contains_key(v)).unwrap_or(false);
+        let selected_release = selected.and_then(|v| releases.iter().find(|r| r.tag == v).cloned());
+        let can_download = selected.is_some()
+            && !selected_is_installed
+            && selected_release.is_some()
+            && !selected_is_downloading;
+        let can_remove = selected.is_some() && selected_is_installed && !locked;
+
+        let mut items = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .gap(px(GAP_EXTRA_SMALL))
+            .overflow_hidden();
+
+        for (entry_index, (tag, _is_installed, _release)) in version_entries.iter().enumerate() {
+            let is_selected = selected == Some(tag.as_str());
+            let tag_clone = tag.clone();
+
+            let display_label = if let Some(progress) = downloads.get(tag) {
+                format!("{tag} ({progress}%)")
+            } else {
+                tag.clone()
+            };
+
+            items = items.child(
+                version_item(
+                    &display_label,
+                    is_selected,
+                    locked,
+                    &self.client_version_focus_handles[entry_index],
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    context.listener(move |this, _, _, context| {
+                        if !this.is_locked() {
+                            this.select_client_version(tag_clone.clone(), context);
+                        }
+                    }),
+                ),
+            );
+        }
+
+        let release_for_download = selected_release.clone();
+        let tag_for_remove = selected.map(|v| v.to_string());
+
+        let buttons = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w(px(CREDENTIAL_BUTTON_WIDTH))
+            .gap(px(GAP_EXTRA_SMALL))
+            .child(
+                button_ghost(
+                    "Add",
+                    locked || !can_download,
+                    &self.client_download_focus_handle,
+                )
+                .when(can_download, |element| {
+                    let release = release_for_download.unwrap();
+                    element.on_mouse_up(
+                        MouseButton::Left,
+                        context.listener(move |this, _, _, context| {
+                            this.download_client_version(release.clone(), context);
+                        }),
+                    )
+                }),
+            )
+            .child(
+                button_ghost(
+                    "Remove",
+                    locked || !can_remove,
+                    &self.client_remove_focus_handle,
+                )
+                .when(can_remove, |element| {
+                    let tag = tag_for_remove.unwrap();
+                    element.on_mouse_up(
+                        MouseButton::Left,
+                        context.listener(move |this, _, _, context| {
+                            this.remove_client_version(tag.clone(), context);
+                        }),
+                    )
+                }),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_hidden()
+            .px(px(PADDING_COLUMN))
+            .pb(px(PADDING_COLUMN))
+            .pt(px(PADDING_COLUMN_TOP))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .gap(px(GAP_EXTRA_SMALL))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(label("Client Versions"))
+                    .when(is_fetching && version_entries.is_empty(), |container| {
+                        container.child(
+                            div()
+                                .px(px(PADDING_INPUT_HORIZONTAL))
+                                .text_size(px(TEXT_SIZE_SMALL))
+                                .text_color(rgb(COLOR_YELLOW))
+                                .child("Downloading version list…"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("client-versions-scroll")
+                            .flex()
+                            .flex_row()
+                            .flex_1()
+                            .gap(px(GAP_SMALL))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.client_scroll_handle)
+                            .child(items)
+                            .child(buttons),
+                    ),
+            )
     }
 
     fn render_status(

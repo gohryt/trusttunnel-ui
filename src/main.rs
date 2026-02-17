@@ -5,6 +5,7 @@
 
 mod app;
 mod app_state;
+mod client_manager;
 mod components;
 mod configuration;
 mod connection_state;
@@ -17,6 +18,8 @@ mod text_area;
 mod text_input;
 mod theme;
 
+use std::sync::{Arc, Mutex};
+
 use gpui::{
     Application, Bounds, KeyBinding, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
     WindowOptions, prelude::*, px, size,
@@ -28,6 +31,7 @@ use crate::{
         TrustTunnelApp,
     },
     app_state::{AppState, apply_saved_order},
+    client_manager::{ClientManagerState, scan_installed_clients},
     configuration::{
         StoredCredential, add_credential_file, credentials_directory, scan_credentials,
     },
@@ -70,7 +74,7 @@ fn main() {
     let _single_instance_guard = match single_instance::acquire() {
         Some(guard) => guard,
         None => {
-            log::warn!("[startup] another instance is already running — exiting");
+            log::warn!("[application_startup] another instance is already running — exiting");
             #[cfg(not(debug_assertions))]
             single_instance::show_already_running_message();
             return;
@@ -95,206 +99,244 @@ fn main() {
 
     system_services.startup_cleanup();
 
-    let (binary_path, binary_found) = system_services.find_client_binary();
-    log::info!(
-        "[startup] client binary: {} (found={})",
-        binary_path,
-        binary_found,
-    );
-
-    if binary_found && let Some(error) = system_services.check_binary_works(&binary_path, false) {
-        log::warn!("[startup] binary check issue: {error}");
-    }
+    let saved_state_early = AppState::load();
+    let installed_clients = scan_installed_clients();
+    let saved_client_version = saved_state_early
+        .selected_client_version()
+        .map(|v| v.to_string());
 
     let credentials_path = credentials_directory();
     let initial_credential = load_initial_credentials(&credentials_path);
-    let saved_state = AppState::load();
     let mut stored_credentials = scan_credentials(&credentials_path);
-    apply_saved_order(&mut stored_credentials, &saved_state.credential_order);
-    let saved_tunnel_mode = saved_state.tunnel_mode();
-    let saved_dns_enabled = saved_state.dns_enabled();
-    let saved_selected_credential = saved_state.find_selected_index(&stored_credentials);
+    apply_saved_order(&mut stored_credentials, &saved_state_early.credential_order);
+    let saved_tunnel_mode = saved_state_early.tunnel_mode();
+    let saved_dns_enabled = saved_state_early.dns_enabled();
+    let saved_selected_credential = saved_state_early.find_selected_index(&stored_credentials);
     let system_services = system_services.clone();
 
-    Application::new().run(move |context| {
-        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), context);
+    let http_client = reqwest_client::ReqwestClient::user_agent("trusttunnel-ui")
+        .expect("failed to create HTTP client");
 
-        bind_keys(context);
+    Application::new()
+        .with_http_client(Arc::new(http_client))
+        .run(move |context| {
+            let client_manager_state = {
+                let mut client_manager_state_value = ClientManagerState::new(context.http_client());
+                client_manager_state_value.installed = installed_clients;
+                client_manager_state_value.selected_version = saved_client_version;
+                Arc::new(Mutex::new(client_manager_state_value))
+            };
 
-        let configuration_path = TrustTunnelApp::configuration_directory().join("client.toml");
-        log::info!(
-            "[startup] configuration path: {}",
-            configuration_path.display()
-        );
-
-        let binary_path_clone = binary_path.clone();
-        let credential = initial_credential.clone();
-        let stored = stored_credentials.clone();
-        let saved_selected = saved_selected_credential;
-
-        let window = context.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: None,
-                is_resizable: true,
-                is_minimizable: true,
-                window_background: WindowBackgroundAppearance::Opaque,
-                window_min_size: Some(size(px(640.0), px(480.0))),
-                window_decorations: Some(WindowDecorations::Client),
-                ..Default::default()
-            },
-            |_, context| {
-                let log_panel = context.new(LogPanel::new);
-
-                let selected_credential = credential
-                    .as_ref()
-                    .and_then(|stored_credential| {
-                        stored
-                            .iter()
-                            .position(|entry| entry.path == stored_credential.path)
-                    })
-                    .or(saved_selected);
-                let active_credential = selected_credential.and_then(|index| stored.get(index));
-
-                let hostname_initial =
-                    active_credential.map(|stored| stored.credential.hostname.as_str());
-                let addresses_initial =
-                    active_credential.map(|stored| stored.credential.addresses.join(", "));
-                let username_initial =
-                    active_credential.map(|stored| stored.credential.username.as_str());
-                let password_initial =
-                    active_credential.map(|stored| stored.credential.password.as_str());
-                let dns_upstreams_initial =
-                    active_credential.map(|stored| stored.credential.dns_upstreams.join(", "));
-
-                let hostname_input =
-                    TextInput::new(context, "example.com", false, hostname_initial);
-                let addresses_input = TextInput::new(
-                    context,
-                    "1.2.3.4:443, 5.6.7.8:443",
-                    false,
-                    addresses_initial.as_deref(),
-                );
-                let username_input = TextInput::new(context, "gohryt", false, username_initial);
-                let password_input =
-                    TextInput::new(context, "I'm lovin' it", true, password_initial);
-                let dns_upstreams_input = TextInput::new(
-                    context,
-                    "tls://1.1.1.1, tls://1.0.0.1",
-                    false,
-                    dns_upstreams_initial.as_deref(),
-                );
-
-                let certificate_initial = active_credential
-                    .map(|stored| stored.credential.certificate.trim())
-                    .filter(|text| !text.is_empty());
-                let certificate_input =
-                    TextArea::new(context, "PEM PUM PAM PUM PUM PAM PAM", certificate_initial);
-
-                let has_ipv6 = active_credential
-                    .map(|stored| stored.credential.has_ipv6)
-                    .unwrap_or(true);
-                let skip_verification = active_credential
-                    .map(|stored| stored.credential.skip_verification)
-                    .unwrap_or(false);
-                let anti_dpi = active_credential
-                    .map(|stored| stored.credential.anti_dpi)
-                    .unwrap_or(false);
-                let killswitch_enabled = active_credential
-                    .map(|stored| stored.credential.killswitch_enabled)
-                    .unwrap_or(false);
-                let post_quantum_group_enabled = active_credential
-                    .map(|stored| stored.credential.post_quantum_group_enabled)
-                    .unwrap_or(true);
-                let upstream_protocol = active_credential
-                    .map(|stored| {
-                        if stored.credential.upstream_protocol.is_empty() {
-                            "http2".into()
-                        } else {
-                            stored.credential.upstream_protocol.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| "http2".into());
-                let upstream_fallback_protocol = active_credential
-                    .map(|stored| stored.credential.upstream_fallback_protocol.clone())
-                    .unwrap_or_default();
-
-                log::info!(
-                    "[startup] binary={}, found={}",
-                    binary_path_clone,
-                    binary_found,
-                );
-
-                context.new(|context| {
-                    TrustTunnelApp::new(
-                        AppInitialization {
-                            hostname_input,
-                            addresses_input,
-                            username_input,
-                            password_input,
-                            certificate_input,
-                            dns_upstreams_input,
-                            has_ipv6,
-                            skip_verification,
-                            upstream_protocol,
-                            upstream_fallback_protocol,
-                            anti_dpi,
-                            killswitch_enabled,
-                            post_quantum_group_enabled,
-                            dns_enabled: saved_dns_enabled,
-                            configuration_path: configuration_path.clone(),
-                            system_services: system_services.clone(),
-                            log_panel,
-                            binary_path: binary_path_clone,
-                            binary_found,
-                            stored_credentials: stored.clone(),
-                            selected_credential,
-                            tunnel_mode: saved_tunnel_mode,
-                        },
-                        context,
-                    )
-                })
-            },
-        );
-
-        match window {
-            Ok(window) => {
-                if let Err(error) = window.update(context, |view, window, context| {
-                    window.set_window_title("TrustTunnel");
-
-                    window.on_window_should_close(context, |_window, _cx| {
-                        log::info!("[close] window close requested by platform");
-                        true
-                    });
-
-                    let handle = view.hostname_input(context);
-                    window.focus(&handle, context);
-                    context.activate(true);
-                }) {
-                    log::error!("[startup] failed to initialize application window: {error}");
-                    context.quit();
-                    return;
+            let (binary_path, binary_found) = {
+                let client_manager_state_guard = client_manager_state.lock().unwrap();
+                if let Some(managed_path) = client_manager_state_guard.selected_binary_path() {
+                    let path_string = managed_path.to_string_lossy().to_string();
+                    let exists = managed_path.exists();
+                    log::info!(
+                        "[application_startup] using managed client binary: {} (exists={})",
+                        path_string,
+                        exists
+                    );
+                    (path_string, exists)
+                } else {
+                    let (path, found) = system_services.find_client_binary();
+                    log::info!(
+                        "[application_startup] no managed client selected, system binary: {} (found={})",
+                        path,
+                        found
+                    );
+                    (path, found)
                 }
+            };
 
-                context.on_action(|_: &Quit, context| context.quit());
+            if binary_found
+                && let Some(error) = system_services.check_binary_works(&binary_path, false)
+            {
+                log::warn!("[application_startup] binary check issue: {error}");
             }
-            Err(error) => {
-                log::error!("[startup] failed to open application window: {error}");
-                context.quit();
+
+            let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), context);
+
+            bind_keys(context);
+
+            let configuration_path = TrustTunnelApp::configuration_directory().join("client.toml");
+            log::info!(
+                "[application_startup] configuration path: {}",
+                configuration_path.display()
+            );
+
+            let binary_path_clone = binary_path.clone();
+            let initial_credential_snapshot = initial_credential.clone();
+            let stored_credentials_snapshot = stored_credentials.clone();
+            let saved_selected_index = saved_selected_credential;
+            let client_manager_state_shared = client_manager_state.clone();
+
+            let window = context.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: None,
+                    is_resizable: true,
+                    is_minimizable: true,
+                    window_background: WindowBackgroundAppearance::Opaque,
+                    window_min_size: Some(size(px(640.0), px(480.0))),
+                    window_decorations: Some(WindowDecorations::Client),
+                    app_id: Some("TrustTunnel".into()),
+                    ..Default::default()
+                },
+                |_, context| {
+                    let log_panel = context.new(LogPanel::new);
+
+                    let selected_credential = initial_credential_snapshot
+                        .as_ref()
+                        .and_then(|stored_credential| {
+                            stored_credentials_snapshot
+                                .iter()
+                                .position(|entry| entry.path == stored_credential.path)
+                        })
+                        .or(saved_selected_index);
+                    let active_credential = selected_credential
+                        .and_then(|index| stored_credentials_snapshot.get(index));
+
+                    let hostname_initial =
+                        active_credential.map(|stored| stored.credential.hostname.as_str());
+                    let addresses_initial =
+                        active_credential.map(|stored| stored.credential.addresses.join(", "));
+                    let username_initial =
+                        active_credential.map(|stored| stored.credential.username.as_str());
+                    let password_initial =
+                        active_credential.map(|stored| stored.credential.password.as_str());
+                    let dns_upstreams_initial =
+                        active_credential.map(|stored| stored.credential.dns_upstreams.join(", "));
+
+                    let hostname_input =
+                        TextInput::new(context, "example.com", false, hostname_initial);
+                    let addresses_input = TextInput::new(
+                        context,
+                        "1.2.3.4:443, 5.6.7.8:443",
+                        false,
+                        addresses_initial.as_deref(),
+                    );
+                    let username_input = TextInput::new(context, "gohryt", false, username_initial);
+                    let password_input =
+                        TextInput::new(context, "I'm lovin' it", true, password_initial);
+                    let dns_upstreams_input = TextInput::new(
+                        context,
+                        "tls://1.1.1.1, tls://1.0.0.1",
+                        false,
+                        dns_upstreams_initial.as_deref(),
+                    );
+
+                    let certificate_initial = active_credential
+                        .map(|stored| stored.credential.certificate.trim())
+                        .filter(|text| !text.is_empty());
+                    let certificate_input =
+                        TextArea::new(context, "PEM PUM PAM PUM PUM PAM PAM", certificate_initial);
+
+                    let has_ipv6 = active_credential
+                        .map(|stored| stored.credential.has_ipv6)
+                        .unwrap_or(true);
+                    let skip_verification = active_credential
+                        .map(|stored| stored.credential.skip_verification)
+                        .unwrap_or(false);
+                    let anti_dpi = active_credential
+                        .map(|stored| stored.credential.anti_dpi)
+                        .unwrap_or(false);
+                    let killswitch_enabled = active_credential
+                        .map(|stored| stored.credential.killswitch_enabled)
+                        .unwrap_or(false);
+                    let post_quantum_group_enabled = active_credential
+                        .map(|stored| stored.credential.post_quantum_group_enabled)
+                        .unwrap_or(true);
+                    let upstream_protocol = active_credential
+                        .map(|stored| {
+                            if stored.credential.upstream_protocol.is_empty() {
+                                "http2".into()
+                            } else {
+                                stored.credential.upstream_protocol.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| "http2".into());
+                    let upstream_fallback_protocol = active_credential
+                        .map(|stored| stored.credential.upstream_fallback_protocol.clone())
+                        .unwrap_or_default();
+
+                    log::info!(
+                        "[application_startup] binary={}, found={}",
+                        binary_path_clone,
+                        binary_found,
+                    );
+
+                    context.new(|context| {
+                        TrustTunnelApp::new(
+                            AppInitialization {
+                                hostname_input,
+                                addresses_input,
+                                username_input,
+                                password_input,
+                                certificate_input,
+                                dns_upstreams_input,
+                                has_ipv6,
+                                skip_verification,
+                                upstream_protocol,
+                                upstream_fallback_protocol,
+                                anti_dpi,
+                                killswitch_enabled,
+                                post_quantum_group_enabled,
+                                dns_enabled: saved_dns_enabled,
+                                configuration_path: configuration_path.clone(),
+                                system_services: system_services.clone(),
+                                log_panel,
+                                binary_path: binary_path_clone,
+                                binary_found,
+                                stored_credentials: stored_credentials_snapshot.clone(),
+                                selected_credential,
+                                tunnel_mode: saved_tunnel_mode,
+                                client_manager_state: client_manager_state_shared,
+                            },
+                            context,
+                        )
+                    })
+                },
+            );
+
+            match window {
+                Ok(window) => {
+                    if let Err(error) = window.update(context, |view, window, context| {
+                        window.set_window_title("TrustTunnel");
+
+                        window.on_window_should_close(context, |_window, _cx| {
+                            log::info!("[close] window close requested by platform");
+                            true
+                        });
+
+                        let handle = view.hostname_input(context);
+                        window.focus(&handle, context);
+                        context.activate(true);
+                    }) {
+                        log::error!("[application_startup] failed to initialize application window: {error}");
+                        context.quit();
+                        return;
+                    }
+
+                    context.on_action(|_: &Quit, context| context.quit());
+                }
+                Err(error) => {
+                    log::error!("[application_startup] failed to open application window: {error}");
+                    context.quit();
+                }
             }
-        }
-    });
+        });
 }
 
 fn load_initial_credentials(credentials_path: &std::path::Path) -> Option<StoredCredential> {
     let path = std::env::args().nth(1)?;
     let source = std::path::PathBuf::from(&path);
-    log::info!("[startup] loading initial credential file: {path}");
+    log::info!("[application_startup] loading initial credential file: {path}");
 
     let destination = match add_credential_file(&source, credentials_path) {
         Ok(destination) => destination,
         Err(error) => {
-            log::warn!("[startup] failed to add credential file: {error}");
+            log::warn!("[application_startup] failed to add credential file: {error}");
             return None;
         }
     };
@@ -303,7 +345,7 @@ fn load_initial_credentials(credentials_path: &std::path::Path) -> Option<Stored
         Some(stored) => stored,
         None => {
             log::warn!(
-                "[startup] credential file was copied but parsing failed: {}",
+                "[application_startup] credential file was copied but parsing failed: {}",
                 destination.display()
             );
             return None;
@@ -311,7 +353,7 @@ fn load_initial_credentials(credentials_path: &std::path::Path) -> Option<Stored
     };
 
     log::info!(
-        "[startup] credential file added and selected: {} ({})",
+        "[application_startup] credential file added and selected: {} ({})",
         stored.name,
         stored.path.display()
     );

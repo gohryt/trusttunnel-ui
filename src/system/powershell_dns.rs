@@ -41,23 +41,23 @@ impl DnsBackend for PowerShellDns {
     fn set(&mut self, upstreams: &[&str]) -> Result<String, String> {
         log::info!("[dns] setting DNS via PowerShell");
 
-        let servers: Vec<&str> = if upstreams.is_empty() {
+        let dns_servers: Vec<&str> = if upstreams.is_empty() {
             dns::DEFAULT_DNS_SERVERS.to_vec()
         } else {
             upstreams.to_vec()
         };
-        let servers_str = servers.join(",");
-        let servers_arg = format!("'{}'", servers_str.replace(',', "','"));
+        let dns_servers_string = dns_servers.join(",");
+        let dns_servers_argument = format!("'{}'", dns_servers_string.replace(',', "','"));
         let set_script = format!(
             r#"Get-NetAdapter | Where-Object {{$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*TUN*' -and $_.InterfaceDescription -notlike '*TAP*' -and $_.InterfaceDescription -notlike '*Loopback*'}} | ForEach-Object {{ Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses {} }}"#,
-            servers_arg
+            dns_servers_argument
         );
 
-        let mut args = POWERSHELL_ARGS.to_vec();
-        args.push(&set_script);
+        let mut argument_list = POWERSHELL_ARGS.to_vec();
+        argument_list.push(&set_script);
 
-        if run_silent("powershell", &args) {
-            let detail = format!("DNS configured via PowerShell ({servers_str})");
+        if run_silent("powershell", &argument_list) {
+            let detail = format!("DNS configured via PowerShell ({dns_servers_string})");
             log::info!("[dns] {detail}");
             Ok(detail)
         } else {
@@ -71,10 +71,10 @@ impl DnsBackend for PowerShellDns {
     fn clear(&mut self) {
         log::info!("[dns] restoring DNS via PowerShell");
 
-        let mut args = POWERSHELL_ARGS.to_vec();
-        args.push(CLEAR_SCRIPT);
+        let mut argument_list = POWERSHELL_ARGS.to_vec();
+        argument_list.push(CLEAR_SCRIPT);
 
-        if !run_silent("powershell", &args) {
+        if !run_silent("powershell", &argument_list) {
             log::warn!("[dns] failed to restore DNS settings");
         }
     }

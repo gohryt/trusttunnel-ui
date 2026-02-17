@@ -35,7 +35,7 @@ mod win32 {
                 Ok(handle) => handle,
                 Err(error) => {
                     log::warn!(
-                        "[win32] OpenProcess failed for pid {}: {}",
+                        "[win32] OpenProcess failed for process_id {}: {}",
                         process_id,
                         error,
                     );
@@ -46,7 +46,7 @@ mod win32 {
             let _ = CloseHandle(handle);
             if let Err(error) = result {
                 log::warn!(
-                    "[win32] TerminateProcess failed for pid {}: {}",
+                    "[win32] TerminateProcess failed for process_id {}: {}",
                     process_id,
                     error,
                 );
@@ -56,17 +56,17 @@ mod win32 {
         }
     }
 
-    pub fn shell_execute_runas_with_args(file: &str, args: Option<&str>) -> bool {
+    pub fn shell_execute_runas_with_args(file: &str, arguments: Option<&str>) -> bool {
         let verb = to_wide("runas");
         let file_wide = to_wide(file);
-        let args_wide = args.map(to_wide);
+        let arguments_wide = arguments.map(to_wide);
 
         let mut info = SHELLEXECUTEINFOW {
-            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
             fMask: SEE_MASK_NOCLOSEPROCESS,
             lpVerb: PCWSTR(verb.as_ptr()),
             lpFile: PCWSTR(file_wide.as_ptr()),
-            lpParameters: args_wide
+            lpParameters: arguments_wide
                 .as_ref()
                 .map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr())),
             nShow: 0, // SW_HIDE
@@ -104,7 +104,7 @@ mod win32 {
                 job,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const std::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
 
             if let Err(error) = result {
@@ -165,7 +165,7 @@ fn create_child_job_guard(child: &Child) -> Option<JobGuard> {
     let process_handle = HANDLE(child.as_raw_handle());
     if win32::assign_process_to_job(job, process_handle) {
         log::info!(
-            "[job] child pid={} assigned to kill-on-close job object",
+            "[job] child process_id={} assigned to kill-on-close job object",
             child.id(),
         );
         Some(JobGuard { handle: job })
@@ -178,13 +178,16 @@ fn create_child_job_guard(child: &Child) -> Option<JobGuard> {
 }
 
 pub fn terminate_process(process_id: u32) -> bool {
-    log::info!("[process] terminating pid {} via native API", process_id);
+    log::info!(
+        "[process] terminating process_id {} via native API",
+        process_id
+    );
     win32::terminate(process_id, 0)
 }
 
 pub fn elevate_terminate_process(process_id: u32) -> bool {
     log::info!(
-        "[process] terminating pid {} via native API (elevated)",
+        "[process] terminating process_id {} via native API (elevated)",
         process_id
     );
     win32::terminate(process_id, 0)
@@ -211,7 +214,7 @@ pub fn spawn_client(
         let _ = std::fs::remove_file(&exit_marker);
 
         // Encode as Base64 UTF-16LE to avoid quoting issues.
-        let ps_command = format!(
+        let powershell_command = format!(
             "& '{}' -c '{}' 2>&1 | Out-File -FilePath '{}' -Encoding utf8; \
              $LASTEXITCODE | Out-File -FilePath '{}'",
             binary.replace('\'', "''"),
@@ -219,12 +222,12 @@ pub fn spawn_client(
             log_path.display().to_string().replace('\'', "''"),
             exit_marker.display().to_string().replace('\'', "''"),
         );
-        let encoded = win32::encode_powershell_command(&ps_command);
-        let ps_args = format!(
+        let encoded = win32::encode_powershell_command(&powershell_command);
+        let powershell_arguments = format!(
             "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand {encoded}",
         );
 
-        if !win32::shell_execute_runas_with_args("powershell.exe", Some(&ps_args)) {
+        if !win32::shell_execute_runas_with_args("powershell.exe", Some(&powershell_arguments)) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "UAC elevation was denied or ShellExecuteEx failed. \
@@ -496,13 +499,13 @@ pub fn is_running_as_admin() -> bool {
 }
 
 pub fn elevated_log_path() -> PathBuf {
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("trusttunnel_elevated_{pid}.log"))
+    let process_id = std::process::id();
+    std::env::temp_dir().join(format!("trusttunnel_elevated_{process_id}.log"))
 }
 
 pub fn elevated_exit_marker_path() -> PathBuf {
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("trusttunnel_elevated_{pid}.exit"))
+    let process_id = std::process::id();
+    std::env::temp_dir().join(format!("trusttunnel_elevated_{process_id}.exit"))
 }
 
 /// Kills by image name — we don't have a handle to the UAC-elevated process.
@@ -523,16 +526,18 @@ pub fn cleanup_elevated_files() {
 }
 
 pub fn cleanup_stale_elevated_files() {
-    let temp = std::env::temp_dir();
-    let entries = match std::fs::read_dir(&temp) {
+    let temporary_directory = std::env::temp_dir();
+    let entries = match std::fs::read_dir(&temporary_directory) {
         Ok(entries) => entries,
         Err(_) => return,
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if (name.starts_with("trusttunnel_elevated_") && name.ends_with(".log"))
-            || (name.starts_with("trusttunnel_elevated_") && name.ends_with(".exit"))
+        let file_name = entry.file_name();
+        let file_name_string = file_name.to_string_lossy();
+        if (file_name_string.starts_with("trusttunnel_elevated_")
+            && file_name_string.ends_with(".log"))
+            || (file_name_string.starts_with("trusttunnel_elevated_")
+                && file_name_string.ends_with(".exit"))
         {
             let own_log = elevated_log_path();
             let own_exit = elevated_exit_marker_path();
