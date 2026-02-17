@@ -27,8 +27,8 @@ use gpui::{
 
 use crate::{
     app::{
-        Activate, AppInitialization, Connect, FocusNext, FocusPrevious, ImportCredential, Quit,
-        TrustTunnelApp,
+        Activate, AppInitialization, FocusNext, FocusPrevious, ImportCredential, Quit, SwitchTab,
+        SwitchTabPrevious, TrustTunnelApp,
     },
     app_state::{AppState, apply_saved_order},
     client_manager::{ClientManagerState, scan_installed_clients},
@@ -414,8 +414,9 @@ fn bind_keys(context: &mut gpui::App) {
     context.bind_keys([
         KeyBinding::new("tab", FocusNext, Some("TrustTunnelApp")),
         KeyBinding::new("shift-tab", FocusPrevious, Some("TrustTunnelApp")),
+        KeyBinding::new("ctrl-tab", SwitchTab, Some("TrustTunnelApp")),
+        KeyBinding::new("ctrl-shift-tab", SwitchTabPrevious, Some("TrustTunnelApp")),
         KeyBinding::new("space", Activate, Some("TrustTunnelApp")),
-        KeyBinding::new("enter", Connect, Some("TrustTunnelApp")),
         KeyBinding::new("cmd-q", Quit, Some("TrustTunnelApp")),
         KeyBinding::new("ctrl-q", Quit, Some("TrustTunnelApp")),
         KeyBinding::new("cmd-o", ImportCredential, Some("TrustTunnelApp")),

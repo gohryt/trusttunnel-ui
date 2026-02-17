@@ -32,7 +32,7 @@ pub fn credential_item(
 ) -> Div {
     let (background, text_color, border) = match (active, disabled) {
         (true, true) => (BORDER, TEXT_DIM, BORDER),
-        (true, false) => (BUTTON_PRIMARY, TEXT_WHITE, BORDER_FOCUS),
+        (true, false) => (ACTIVE_BACKGROUND, TEXT_PRIMARY, BORDER_STRONG),
         (false, _) => (
             INPUT_BACKGROUND,
             if disabled { TEXT_DIM } else { TEXT_PRIMARY },
@@ -65,12 +65,16 @@ pub fn credential_item(
                 })
                 .when(active, |element| {
                     element
-                        .hover(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
-                        .focus(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
+                        .hover(|style| style.bg(rgb(ACTIVE_HOVER)))
+                        .focus(|style| style.border_color(rgb(BORDER_FOCUS)))
                 })
                 .when(!active, |element| {
                     element
-                        .hover(|style| style.border_color(rgb(BORDER_FOCUS)))
+                        .hover(|style| {
+                            style
+                                .bg(rgb(ACTIVE_BACKGROUND))
+                                .border_color(rgb(BORDER_STRONG))
+                        })
                         .focus(|style| style.border_color(rgb(BORDER_FOCUS)))
                 })
         })
@@ -87,10 +91,16 @@ pub fn toggle(
 ) -> Div {
     let (background, border, dot_offset) = match (value, locked) {
         (true, true) => (BORDER, BORDER, px(TOGGLE_DOT_ON_OFFSET)),
-        (true, false) => (BUTTON_PRIMARY, BORDER_FOCUS, px(TOGGLE_DOT_ON_OFFSET)),
+        (true, false) => (BUTTON_PRIMARY, BUTTON_PRIMARY, px(TOGGLE_DOT_ON_OFFSET)),
         (false, _) => (INPUT_BACKGROUND, BORDER, px(TOGGLE_DOT_OFF_OFFSET)),
     };
-    let dot_color = if locked { TEXT_DIM } else { TEXT_WHITE };
+    let dot_color = if locked {
+        TEXT_DIM
+    } else if value {
+        TEXT_WHITE
+    } else {
+        TEXT_PRIMARY
+    };
 
     div()
         .flex()
@@ -115,13 +125,23 @@ pub fn toggle(
                         .cursor_pointer()
                         .when(value, |element| {
                             element
-                                .hover(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
-                                .focus(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
+                                .hover(|style| style.bg(rgb(BUTTON_HOVER)))
+                                .focus(|style| {
+                                    style.border_color(rgb(BORDER_FOCUS)).bg(rgb(BUTTON_HOVER))
+                                })
                         })
                         .when(!value, |element| {
                             element
-                                .hover(|style| style.border_color(rgb(BORDER_FOCUS)))
-                                .focus(|style| style.border_color(rgb(BORDER_FOCUS)))
+                                .hover(|style| {
+                                    style
+                                        .bg(rgb(ACTIVE_BACKGROUND))
+                                        .border_color(rgb(BORDER_STRONG))
+                                })
+                                .focus(|style| {
+                                    style
+                                        .border_color(rgb(BORDER_FOCUS))
+                                        .bg(rgb(ACTIVE_BACKGROUND))
+                                })
                         })
                 })
                 .on_mouse_up(MouseButton::Left, move |event, window, context| {
@@ -142,7 +162,7 @@ pub fn toggle(
 pub fn selector_option(text: &str, active: bool, locked: bool, focus_handle: &FocusHandle) -> Div {
     let (background, text_color, border) = match (active, locked) {
         (true, true) => (BORDER, TEXT_DIM, BORDER),
-        (true, false) => (BUTTON_PRIMARY, TEXT_WHITE, BORDER_FOCUS),
+        (true, false) => (ACTIVE_BACKGROUND, TEXT_PRIMARY, BORDER_STRONG),
         (false, _) => (INPUT_BACKGROUND, TEXT_DIM, BORDER),
     };
 
@@ -164,12 +184,17 @@ pub fn selector_option(text: &str, active: bool, locked: bool, focus_handle: &Fo
                 .cursor_pointer()
                 .when(active, |element| {
                     element
-                        .hover(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
-                        .focus(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
+                        .hover(|style| style.bg(rgb(ACTIVE_HOVER)))
+                        .focus(|style| style.border_color(rgb(BORDER_FOCUS)))
                 })
                 .when(!active, |element| {
                     element
-                        .hover(|style| style.border_color(rgb(BORDER_FOCUS)))
+                        .hover(|style| {
+                            style
+                                .bg(rgb(ACTIVE_BACKGROUND))
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .border_color(rgb(BORDER_STRONG))
+                        })
                         .focus(|style| style.border_color(rgb(BORDER_FOCUS)))
                 })
         })
@@ -214,14 +239,15 @@ pub fn button_action(
         .rounded(px(RADIUS))
         .border_1()
         .border_color(gpui::transparent_black())
+        .when(disabled, |element| element.opacity(0.4))
         .when(!disabled, |element| {
             element
                 .cursor_pointer()
                 .hover(move |style| style.bg(rgb(hover_background)))
-                .focus(|style| {
+                .focus(move |style| {
                     style
                         .border_color(rgb(BORDER_FOCUS))
-                        .bg(rgb(BUTTON_PRIMARY_FOCUS))
+                        .bg(rgb(hover_background))
                 })
         })
         .text_color(rgb(text_color))
@@ -242,29 +268,20 @@ pub fn button_ghost(text: &str, disabled: bool, focus_handle: &FocusHandle) -> D
         .border_1()
         .border_color(rgb(BORDER))
         .rounded(px(RADIUS))
+        .when(disabled, |element| element.opacity(0.4))
         .when(!disabled, |element| element.cursor_pointer())
         .text_color(rgb(if disabled { TEXT_DIM } else { TEXT_PRIMARY }))
         .text_size(px(TEXT_SIZE_MEDIUM))
         .when(!disabled, |element| {
             element
-                .hover(|style| style.border_color(rgb(BORDER_FOCUS)))
+                .hover(|style| {
+                    style
+                        .bg(rgb(ACTIVE_BACKGROUND))
+                        .border_color(rgb(BORDER_STRONG))
+                })
                 .focus(|style| style.border_color(rgb(BORDER_FOCUS)))
         })
         .child(text.to_string())
-}
-
-pub fn status_dot(color: u32) -> Div {
-    div()
-        .size(px(STATUS_DOT_SIZE))
-        .rounded(px(STATUS_DOT_SIZE / 2.0))
-        .bg(rgb(color))
-}
-
-pub fn status_label(text: String, color: u32) -> Div {
-    div()
-        .text_size(px(TEXT_SIZE_MEDIUM))
-        .text_color(rgb(color))
-        .child(text)
 }
 
 pub fn status_detail(text: String) -> Div {
@@ -287,12 +304,22 @@ pub fn titlebar_tab(
         .px(px(PADDING_COLUMN + PADDING_INPUT_HORIZONTAL))
         .h(px(TITLEBAR_HEIGHT))
         .text_size(px(TEXT_SIZE_SMALL))
-        .when(active, |element| element.text_color(rgb(TEXT_PRIMARY)))
+        .border_b_1()
+        .border_color(rgb(TITLEBAR_BACKGROUND))
+        .when(active, |element| {
+            element
+                .text_color(rgb(TEXT_PRIMARY))
+                .border_color(rgb(TEXT_PRIMARY))
+        })
         .when(!active && !disabled, |element| {
             element
                 .text_color(rgb(TEXT_DIM))
                 .cursor_pointer()
-                .hover(|style| style.text_color(rgb(TEXT_PRIMARY)).bg(rgb(BORDER)))
+                .hover(|style| {
+                    style
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .border_color(rgb(TEXT_PRIMARY))
+                })
         })
         .when(disabled, |element| {
             element
@@ -306,7 +333,7 @@ pub fn titlebar_tab(
 pub fn version_item(tag: &str, active: bool, disabled: bool, focus_handle: &FocusHandle) -> Div {
     let (background, text_color, border) = match (active, disabled) {
         (true, true) => (BORDER, TEXT_DIM, BORDER),
-        (true, false) => (BUTTON_PRIMARY, TEXT_WHITE, BORDER_FOCUS),
+        (true, false) => (ACTIVE_BACKGROUND, TEXT_PRIMARY, BORDER_STRONG),
         (false, _) => (
             INPUT_BACKGROUND,
             if disabled { TEXT_DIM } else { TEXT_PRIMARY },
@@ -334,12 +361,16 @@ pub fn version_item(tag: &str, active: bool, disabled: bool, focus_handle: &Focu
                 .cursor_pointer()
                 .when(active, |element| {
                     element
-                        .hover(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
-                        .focus(|style| style.bg(rgb(BUTTON_PRIMARY_FOCUS)))
+                        .hover(|style| style.bg(rgb(ACTIVE_HOVER)))
+                        .focus(|style| style.border_color(rgb(BORDER_FOCUS)))
                 })
                 .when(!active, |element| {
                     element
-                        .hover(|style| style.border_color(rgb(BORDER_FOCUS)))
+                        .hover(|style| {
+                            style
+                                .bg(rgb(ACTIVE_BACKGROUND))
+                                .border_color(rgb(BORDER_STRONG))
+                        })
                         .focus(|style| style.border_color(rgb(BORDER_FOCUS)))
                 })
         })
@@ -356,16 +387,22 @@ pub fn titlebar_button(id: impl Into<ElementId>, text: &str, danger: bool) -> St
         .h(px(TITLEBAR_HEIGHT))
         .text_size(px(TEXT_SIZE_SMALL))
         .text_color(rgb(TEXT_DIM))
+        .border_b_1()
+        .border_color(rgb(TITLEBAR_BACKGROUND))
         .cursor_pointer()
         .when(danger, |element| {
             element.hover(|style| {
                 style
-                    .bg(rgb(BUTTON_DANGER_HOVER))
-                    .text_color(rgb(TEXT_WHITE))
+                    .text_color(rgb(BUTTON_DANGER))
+                    .border_color(rgb(BUTTON_DANGER))
             })
         })
         .when(!danger, |element| {
-            element.hover(|style| style.bg(rgb(BORDER)).text_color(rgb(TEXT_PRIMARY)))
+            element.hover(|style| {
+                style
+                    .text_color(rgb(TEXT_PRIMARY))
+                    .border_color(rgb(TEXT_PRIMARY))
+            })
         })
         .child(text.to_string())
 }
@@ -378,7 +415,7 @@ pub fn log_container() -> Stateful<Div> {
         .flex_1()
         .w_full()
         .rounded(px(RADIUS))
-        .bg(rgb(LOG_BACKGROUND))
+        .bg(rgb(INPUT_BACKGROUND))
         .border_1()
         .border_color(rgb(BORDER))
         .p(px(PADDING_LOG))

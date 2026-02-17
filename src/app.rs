@@ -42,6 +42,8 @@ actions!(
         Disconnect,
         FocusNext,
         FocusPrevious,
+        SwitchTab,
+        SwitchTabPrevious,
         Activate,
         Quit,
         AddCredential,
@@ -1814,6 +1816,32 @@ impl TrustTunnelApp {
         Self::focus_entry(&entries, 0, window, context);
     }
 
+    fn switch_tab_next(
+        &mut self,
+        _: &SwitchTab,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let next_tab = match self.active_tab {
+            ActiveTab::Connection => ActiveTab::Client,
+            ActiveTab::Client => ActiveTab::Connection,
+        };
+        self.switch_tab(next_tab, context);
+    }
+
+    fn switch_tab_previous(
+        &mut self,
+        _: &SwitchTabPrevious,
+        _window: &mut Window,
+        context: &mut Context<Self>,
+    ) {
+        let previous_tab = match self.active_tab {
+            ActiveTab::Connection => ActiveTab::Client,
+            ActiveTab::Client => ActiveTab::Connection,
+        };
+        self.switch_tab(previous_tab, context);
+    }
+
     fn quit(&mut self, _: &Quit, _window: &mut Window, context: &mut Context<Self>) {
         log::info!("[quit] shutting down");
         self.save_draft_credential(context);
@@ -1893,12 +1921,9 @@ impl Render for TrustTunnelApp {
             context.notify();
         }
 
-        let state_label_text = self.connection_state.label();
-        let state_color = self.connection_state.color();
         let detail = self.status_detail.clone();
         let tunnel_mode = self.tunnel_mode;
         let locked = self.is_locked();
-        let busy = self.connection_state.is_busy();
 
         {
             let lines: Vec<String> = self
@@ -1927,12 +1952,16 @@ impl Render for TrustTunnelApp {
         self.certificate_input
             .update(context, |area, _| area.disabled = locked);
 
-        let (button_label, button_background, button_hover_background) = match self.connection_state
+        let (button_label, button_background, button_hover_background, button_busy) = match &self
+            .connection_state
         {
-            ConnectionState::Connected | ConnectionState::Disconnecting => {
-                ("Disconnect", BUTTON_DANGER, BUTTON_DANGER_HOVER)
+            ConnectionState::Disconnected => ("Connect", BUTTON_FILLED, BUTTON_FILLED_HOVER, false),
+            ConnectionState::Connecting => ("Connecting…", COLOR_YELLOW, COLOR_YELLOW, true),
+            ConnectionState::Connected => ("Disconnect", BUTTON_DANGER, BUTTON_DANGER_HOVER, false),
+            ConnectionState::Disconnecting => ("Disconnecting…", COLOR_YELLOW, COLOR_YELLOW, true),
+            ConnectionState::Error(message) => {
+                (message.as_str(), COLOR_RED, BUTTON_FILLED_HOVER, false)
             }
-            _ => ("Connect", BUTTON_PRIMARY, BUTTON_HOVER),
         };
 
         let upstream = self.upstream_protocol.clone();
@@ -1953,6 +1982,8 @@ impl Render for TrustTunnelApp {
             .on_action(context.listener(Self::disconnect))
             .on_action(context.listener(Self::focus_next))
             .on_action(context.listener(Self::focus_previous))
+            .on_action(context.listener(Self::switch_tab_next))
+            .on_action(context.listener(Self::switch_tab_previous))
             .on_action(context.listener(Self::activate))
             .on_action(context.listener(Self::quit))
             .on_action(context.listener(Self::add_credential))
@@ -2117,17 +2148,22 @@ impl Render for TrustTunnelApp {
                                         button_label,
                                         button_background,
                                         button_hover_background,
-                                        busy,
+                                        button_busy,
                                         &self.connect_button_focus_handle,
                                     )
-                                    .when(!busy, |element| {
-                                        element.on_mouse_up(
-                                            MouseButton::Left,
-                                            context.listener(Self::on_connect_click),
-                                        )
-                                    }),
+                                    .when(
+                                        !button_busy,
+                                        |element| {
+                                            element.on_mouse_up(
+                                                MouseButton::Left,
+                                                context.listener(Self::on_connect_click),
+                                            )
+                                        },
+                                    ),
                                 )
-                                .child(self.render_status(state_label_text, state_color, detail))
+                                .when(!detail.is_empty(), |container| {
+                                    container.child(status_detail(detail))
+                                })
                                 .child(
                                     div()
                                         .flex()
@@ -2827,30 +2863,5 @@ impl TrustTunnelApp {
                             .child(buttons),
                     ),
             )
-    }
-
-    fn render_status(
-        &self,
-        state_label_text: String,
-        state_color: u32,
-        detail: String,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(GAP_EXTRA_SMALL))
-            .px(px(PADDING_INPUT_HORIZONTAL))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(GAP_SMALL))
-                    .child(status_dot(state_color))
-                    .child(status_label(state_label_text, state_color)),
-            )
-            .when(!detail.is_empty(), |element| {
-                element.child(status_detail(detail))
-            })
     }
 }

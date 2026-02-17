@@ -819,6 +819,9 @@ impl Render for TextArea {
                     .border_1()
                     .border_color(rgb(border))
                     .rounded(px(RADIUS))
+                    .when(!disabled && !focused, |element| {
+                        element.hover(|style| style.border_color(rgb(BORDER_STRONG)))
+                    })
                     .child(TextAreaElement {
                         area: context.entity().clone(),
                     }),

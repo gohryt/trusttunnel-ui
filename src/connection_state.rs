@@ -1,5 +1,3 @@
-use crate::theme::{COLOR_GREEN, COLOR_RED, COLOR_YELLOW, TEXT_DIM};
-
 #[derive(Clone)]
 pub enum ConnectionState {
     Disconnected,
@@ -10,26 +8,6 @@ pub enum ConnectionState {
 }
 
 impl ConnectionState {
-    pub fn label(&self) -> String {
-        match self {
-            Self::Disconnected => "Disconnected".into(),
-            Self::Connecting => "Connecting…".into(),
-            Self::Connected => "Connected".into(),
-            Self::Disconnecting => "Disconnecting…".into(),
-            Self::Error(message) => format!("Error: {message}"),
-        }
-    }
-
-    pub fn color(&self) -> u32 {
-        match self {
-            Self::Disconnected => TEXT_DIM,
-            Self::Connecting => COLOR_YELLOW,
-            Self::Connected => COLOR_GREEN,
-            Self::Disconnecting => COLOR_YELLOW,
-            Self::Error(_) => COLOR_RED,
-        }
-    }
-
     pub fn is_connected(&self) -> bool {
         matches!(self, Self::Connected)
     }
